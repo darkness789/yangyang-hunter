@@ -108,7 +108,10 @@ def depth_search(board, seconds=60, seed=0, initial_state=None,
                 available_counts[board.tiles[index].type] += 1
             key = (tray, tuple(available_counts), counts)
         else:
-            key = (removed, tray)
+            # With no tools, each type's tray count is fixed by the set of
+            # clicked tiles (and the fixed initial state). Keeping the tray
+            # in the transposition key only duplicates memory and hashing.
+            key = removed
         if key in seen:
             return "dead"
         seen.add(key)

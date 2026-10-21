@@ -106,7 +106,8 @@ class ToolEngine:
 
 def search_with_tools(board, seconds=180, max_states=10_000_000,
                       max_branches=6, seed=0, allow_remove=True,
-                      allow_revive=True, prefix=(), initial_state=None):
+                      allow_revive=True, prefix=(), initial_state=None,
+                      remove_min=6, priority_jitter=18):
     if prefix and initial_state is not None:
         raise ValueError("Use either prefix or initial_state")
     start = time.monotonic()
@@ -138,7 +139,10 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
             return "solved"
         if len(path) > len(best):
             best = path.copy()
-        key = (removed, tray, moved, used_remove, used_revive)
+        # Once both order-sensitive tools are spent, only tray counts affect
+        # future matches. Canonicalizing their order merges equivalent states.
+        tray_key = tuple(sorted(tray)) if used_remove and used_revive else tray
+        key = (removed, tray_key, moved, used_remove, used_revive)
         if key in seen:
             return "dead"
         seen.add(key)
@@ -159,7 +163,7 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
 
         # Move Out is most useful when the tray is nearly full. It transfers
         # cards into the three auxiliary slots; those cards remain playable.
-        if allow_remove and not used_remove and len(tray) >= 6:
+        if allow_remove and not used_remove and len(tray) >= remove_min:
             count = min(3, len(tray))
             path.append("MOVE_OUT")
             result = visit(removed, available, tray[count:],
@@ -187,7 +191,7 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
             score = (100 if held == 2 else 50 if held else 0)
             score += tile.layer * 2 + unlocks * 8
             if seed:
-                score += randomizer.uniform(-18, 18)
+                score += randomizer.uniform(-priority_jitter, priority_jitter)
             return score
 
         choices.sort(key=priority, reverse=True)

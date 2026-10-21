@@ -18,8 +18,9 @@ from PIL import ImageChops, ImageGrab, ImageStat
 
 from .board_model import Board, IllegalMove
 from .map_templates import acquire_second_stage_template
+from .route_planner import plan_route
 from .solve import depth_search, replay
-from .solve_with_tools import ToolEngine, diverse_beam_search, search_with_tools
+from .solve_with_tools import ToolEngine
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -27,6 +28,7 @@ ROOT = PACKAGE_ROOT.parent
 CAPTURES = ROOT / "captures"
 SCRIPTS = ROOT / "scripts"
 SEARCH_TIMEOUT_SECONDS = 30
+SEARCH_BUDGET_SECONDS = 120
 TITLE = "\u7f8a\u4e86\u4e2a\u7f8a\uff1a\u661f\u7403"
 ICON_NAMES = {
     1: "青草", 2: "胡萝卜", 3: "玉米", 5: "叉子", 6: "白菜",
@@ -175,6 +177,7 @@ class Assistant:
         self.capture_stamp = None
         self.solving = False
         self.preparing = False
+        self.prepare_attempt = 0
         self.search_failed = False
         self.search_attempt = 0
         self.last_down = False
@@ -781,26 +784,19 @@ class Assistant:
         self.search_attempt += 1
         attempt = self.search_attempt
         self.status.set("正在计算当前局面的路线…")
+        self.root.after(SEARCH_TIMEOUT_SECONDS * 1000, lambda: self.status.set(
+            "已搜索 30 秒，仍在继续找完整路线；结束后可考虑重新开局。")
+            if self.solving and self.search_attempt == attempt else None)
 
         def work():
             try:
                 if engine:
-                    deadline = time.monotonic() + SEARCH_TIMEOUT_SECONDS
                     search_state = engine.search_start(state)
-                    result = search_with_tools(
-                        board, seconds=min(18, SEARCH_TIMEOUT_SECONDS),
-                        max_states=2_000_000, max_branches=8,
-                        seed=attempt, initial_state=search_state)
-                    if result["status"] != "solved":
-                        self.root.after(0, lambda: self.status.set(
-                            "深度搜索未找到路线，正在尝试多局面搜索…"))
-                        remaining = deadline - time.monotonic()
-                        if remaining > 0:
-                            result = diverse_beam_search(
-                                board, seconds=remaining, width=600,
-                                seed=attempt, initial_state=search_state,
-                                allow_remove=not state.used_remove,
-                                allow_revive=not state.used_revive)
+                    result = plan_route(
+                        board, seconds=SEARCH_BUDGET_SECONDS,
+                        initial_state=search_state,
+                        on_progress=lambda message: self.root.after(
+                            0, lambda text=message: self.status.set(text)))
                     ids = [board.tiles[item].id if isinstance(item, int) else item
                            for item in result["path"]]
                     check = state
@@ -817,7 +813,7 @@ class Assistant:
                     verified = (result["status"] == "solved" and
                                 replay(board, result["path"], state))
                 if result["status"] != "solved" or not verified:
-                    raise ValueError("30 秒内未找到完整路线。建议点“监听下一局”，再在游戏里重新开一把；也可再次点“重新规划”继续尝试。这不代表无解")
+                    raise ValueError("本次搜索未找到完整路线。可再试重新规划或重新开局；这不代表无解")
                 self.root.after(0, lambda: self._finish_replan(board, state, ids, None))
             except Exception as exc:
                 self.root.after(0, lambda error=str(exc): self._finish_replan(board, state, None, error))
@@ -935,6 +931,8 @@ class Assistant:
         threading.Thread(target=work, daemon=True).start()
 
     def _prepare_new_board(self):
+        self.prepare_attempt += 1
+        attempt = self.prepare_attempt
         try:
             seed = json.loads((CAPTURES / "recovered_seed.json").read_text(encoding="utf-8"))
             template = acquire_second_stage_template(
@@ -948,41 +946,18 @@ class Assistant:
                            check=True, capture_output=True, text=True, timeout=30)
             board = Board.from_json(typed)
             engine = ToolEngine(board)
-            deadline = time.monotonic() + SEARCH_TIMEOUT_SECONDS
-            self.root.after(0, lambda: self.status.set("正在搜索路线（最多 30 秒）…"))
-            normal = depth_search(board, seconds=12, seed=0,
-                                  max_branches=8, max_states=1_500_000)
+            self.root.after(0, lambda: self.status.set("正在搜索完整路线…"))
+            self.root.after(SEARCH_TIMEOUT_SECONDS * 1000, lambda: self.status.set(
+                "已搜索 30 秒，仍在继续找完整路线；结束后可考虑重新开局。")
+                if self.preparing and self.prepare_attempt == attempt else None)
+            planned = plan_route(
+                board, seconds=SEARCH_BUDGET_SECONDS,
+                on_progress=lambda message: self.root.after(
+                    0, lambda text=message: self.status.set(text)))
             actions = None
-            if normal["status"] == "solved":
-                actions = [board.tiles[index].id for index in normal["path"]]
-            else:
-                remaining = deadline - time.monotonic()
-                if remaining > 0:
-                    self.root.after(0, lambda: self.status.set(
-                        "正在尝试移出和复活道具…"))
-                    prefix = normal["path"][:len(normal["path"]) * 4 // 5]
-                    planned = search_with_tools(
-                        board, seconds=min(12, remaining),
-                        max_states=2_000_000, max_branches=8,
-                        seed=0, prefix=prefix)
-                    if planned["status"] == "solved":
-                        actions = [board.tiles[item].id if isinstance(item, int)
-                                   else item for item in planned["path"]]
-                remaining = deadline - time.monotonic()
-                if actions is None and remaining > 0:
-                    self.root.after(0, lambda: self.status.set(
-                        "正在检查其他路线…"))
-                    beam_prefix = normal["path"][:len(normal["path"]) // 3]
-                    prefix_state = engine.initial()
-                    for index in beam_prefix:
-                        prefix_state = engine.apply(prefix_state, board.tiles[index].id)
-                    planned = diverse_beam_search(
-                        board, seconds=remaining, width=700, seed=7,
-                        initial_state=engine.search_start(prefix_state))
-                    if planned["status"] == "solved":
-                        actions = ([board.tiles[index].id for index in beam_prefix] +
-                                   [board.tiles[item].id if isinstance(item, int)
-                                    else item for item in planned["path"]])
+            if planned["status"] == "solved":
+                actions = [board.tiles[item].id if isinstance(item, int)
+                           else item for item in planned["path"]]
             if actions is not None:
                 check = engine.initial()
                 for action in actions:
@@ -1014,7 +989,7 @@ class Assistant:
         self.stage2_active = False
         self.stage2_hits = 0
         self.search_failed = True
-        self.status.set("30 秒内未找到完整路线，这把可能较难。建议点“监听下一局”，再在游戏里重新开一把；也可点“重新规划”继续尝试。这不代表无解。")
+        self.status.set("本次搜索未找到完整路线。这把可能较难；可重新规划或重新开局。这不代表无解。")
         self.render()
 
     def _close(self):
