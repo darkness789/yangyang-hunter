@@ -1,7 +1,4 @@
-"""Windows desktop overlay for manually playing Sheep Planet solutions.
-
-Only observes mouse input and screenshots; it never sends game clicks.
-"""
+"""Windows desktop overlay for assisted Sheep Planet play."""
 
 from __future__ import annotations
 
@@ -47,6 +44,12 @@ user32.GetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int)
 user32.SetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_long)
 user32.SetLayeredWindowAttributes.argtypes = (
     ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ubyte, ctypes.c_ulong)
+user32.SetForegroundWindow.argtypes = (ctypes.c_void_p,)
+user32.SetForegroundWindow.restype = ctypes.c_bool
+user32.SetCursorPos.argtypes = (ctypes.c_int, ctypes.c_int)
+user32.SetCursorPos.restype = ctypes.c_bool
+user32.mouse_event.argtypes = (ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+                               ctypes.c_ulong, ctypes.c_ulong)
 try:
     user32.SetProcessDPIAware()
 except OSError:
@@ -172,6 +175,7 @@ class Assistant:
         self.capture_stamp = None
         self.solving = False
         self.preparing = False
+        self.search_failed = False
         self.search_attempt = 0
         self.last_down = False
         self.rect = None
@@ -185,6 +189,9 @@ class Assistant:
         self.tray = tk.StringVar(value="")
         self.overlay_enabled = tk.BooleanVar(value=True)
         self.auto_track = tk.BooleanVar(value=True)
+        self.auto_click = tk.BooleanVar(value=False)
+        self.auto_next_at = 0.0
+        self.auto_pending = False
         self._build_ui()
         self.root.after(150, self._initial_load)
         self.root.after(60, self._poll)
@@ -217,6 +224,8 @@ class Assistant:
         ttk.Button(row2, text="停止监听", command=self.stop_capture).pack(side="left", padx=5)
         ttk.Checkbutton(row2, text="显示标记", variable=self.overlay_enabled).pack(side="left")
         ttk.Checkbutton(main, text="自动识别我在游戏中的点击", variable=self.auto_track).pack(anchor="w")
+        ttk.Checkbutton(main, text="自动点击普通牌（道具手动）", variable=self.auto_click,
+                        command=self._auto_mode_changed).pack(anchor="w")
         row3 = ttk.Frame(main)
         row3.pack(fill="x", pady=(6, 0))
         self.manual_choice = tk.StringVar()
@@ -226,7 +235,7 @@ class Assistant:
         self.manual_picker.pack(side="left")
         ttk.Button(row3, text="补记这张牌", command=self.manual_sync).pack(side="left", padx=5)
         ttk.Button(row3, text="重试", command=self.clear_pending).pack(side="left")
-        self.root.geometry(f"410x390+{x}+{y}")
+        self.root.geometry(f"410x420+{x}+{y}")
         self.overlay = tk.Toplevel(self.root)
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
@@ -296,6 +305,7 @@ class Assistant:
         self.aux_centers = None
         self.aux_rect = None
         self.stage2_active = resume > 0
+        self.search_failed = False
         self.stage2_hits = 0
         self.status.set("已连接。请在游戏中手动点击标记的牌。" if self.stage2_active
                         else "第一关自行完成；检测到第二关后自动开始辅助。")
@@ -325,6 +335,7 @@ class Assistant:
         self.aux_centers = None
         self.aux_rect = None
         self.stage2_active = resume > 0
+        self.search_failed = False
         self.stage2_hits = 0
         self.status.set("已载入含移出和复活的完整路线。" if self.stage2_active
                         else "第一关自行完成；检测到第二关后自动开始辅助。")
@@ -348,7 +359,7 @@ class Assistant:
             aux_text = ""
         self.tray.set("槽位：" + tray_text + aux_text)
         if not self.stage2_active:
-            self.target.set("等待第二关")
+            self.target.set("建议重新开一把" if self.search_failed else "等待第二关")
         elif ((self.tool_engine.won(self.state) if self.tool_engine
                else self.board.won(self.state))):
             self.target.set("已完成！")
@@ -367,7 +378,7 @@ class Assistant:
                 tile = self.board.tiles[self.board.index[action]]
                 self.target.set(f"{ICON_NAMES.get(tile.type, str(tile.type))}  ·  {tile.id}")
         else:
-            self.target.set("等待重新规划")
+            self.target.set("建议重新开一把" if self.search_failed else "等待重新规划")
         visible = self.board.visible_indices(self.state)
         self.manual_choices = {
             f"{ICON_NAMES.get(self.board.tiles[index].type, self.board.tiles[index].type)} · {self.board.tiles[index].id}":
@@ -434,6 +445,81 @@ class Assistant:
                  top + (y-old_top)*height/old_height)
                 for x, y in self.aux_centers]
 
+    def _auto_mode_changed(self):
+        self.auto_next_at = time.monotonic() + 0.35
+        if not self.auto_click.get():
+            self.status.set("自动点击已关闭。")
+            return
+        self.auto_track.set(True)
+        hwnd = user32.FindWindowW(None, TITLE)
+        if hwnd:
+            user32.SetForegroundWindow(hwnd)
+        if not self.plan:
+            if self.board:
+                self.status.set("自动点击已开启，但当前没有完整路线。建议重新开一把或点“重新规划”。")
+            else:
+                self.status.set("自动点击已开启；等待完整路线。")
+        else:
+            self.status.set("自动点击已开启；道具操作仍需手动完成。")
+
+    def _poll_auto(self):
+        if (not self.auto_click.get() or not self.board or not self.plan or
+                not self.stage2_active or self.pending or self.solving or
+                self.preparing or time.monotonic() < self.auto_next_at):
+            return
+        action = self.plan[0]
+        if action in ("MOVE_OUT", "REVIVE"):
+            hint = ("请手动使用“移出”道具，自动点击会在识别后继续。" if action == "MOVE_OUT"
+                    else "请手动使用“复活”并点“确认这步已完成”，自动点击随后继续。")
+            if self.status.get() != hint:
+                self.status.set(hint)
+            return
+        rect = game_rect()
+        hwnd = user32.FindWindowW(None, TITLE)
+        if not rect or user32.GetForegroundWindow() != hwnd:
+            hint = "自动点击已暂停：请激活游戏窗口。"
+            if self.status.get() != hint:
+                self.status.set(hint)
+            return
+        if user32.GetAsyncKeyState(0x01) & 0x8000:
+            return
+        if isinstance(action, tuple):
+            centers = self._aux_points(rect)
+            if not centers:
+                hint = "无法定位移出区，请手动点击标记的牌；识别后自动继续。"
+                if self.status.get() != hint:
+                    self.status.set(hint)
+                return
+            x, y = centers[action[1]]
+        else:
+            x, y = tile_center(self.board.tiles[self.board.index[action]], rect)
+        self._candidate_click(x, y, rect)
+        if not self.pending or self.pending[0] != action:
+            self.pending = None
+            self.auto_click.set(False)
+            self.status.set("自动点击位置与路线不一致，已暂停。请手动核对牌面。")
+            return
+        self.auto_pending = True
+        old_x, old_y = cursor()
+        button_down = False
+        try:
+            if not user32.SetCursorPos(round(x), round(y)):
+                raise OSError("无法移动鼠标到目标牌")
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            button_down = True
+            time.sleep(0.04)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            button_down = False
+        except Exception as exc:
+            self.pending = None
+            self.auto_pending = False
+            self.auto_click.set(False)
+            self.status.set(f"自动点击已暂停：{exc}")
+        finally:
+            if button_down:
+                user32.mouse_event(0x0004, 0, 0, 0, 0)
+            user32.SetCursorPos(old_x, old_y)
+
     def _poll(self):
         try:
             self._poll_mouse()
@@ -441,6 +527,7 @@ class Assistant:
                 self._poll_capture()
             if self.board is not None and not self.stage2_active:
                 self._poll_stage()
+            self._poll_auto()
             if self.board is not None:
                 rect = game_rect()
                 foreground = user32.GetForegroundWindow()
@@ -460,7 +547,8 @@ class Assistant:
         key_state = user32.GetAsyncKeyState(0x01)
         down = bool(key_state & 0x8000)
         pressed = bool(key_state & 0x0001)
-        if ((down or pressed) and not self.last_down and self.auto_track.get()
+        if ((down or pressed) and not self.last_down and
+                (self.auto_track.get() or self.auto_click.get())
                 and self.board and self.stage2_active and not self.pending
                 and user32.GetForegroundWindow() == user32.FindWindowW(None, TITLE)):
             rect = game_rect()
@@ -483,7 +571,8 @@ class Assistant:
         self.stage2_hits = self.stage2_hits + 1 if visible else 0
         if self.stage2_hits >= 2:
             self.stage2_active = True
-            self.status.set("检测到第二关，已开始显示通关提示。")
+            if self.plan:
+                self.status.set("检测到第二关，已开始显示通关提示。")
             self.render()
 
     def _candidate_click(self, x, y, rect):
@@ -558,10 +647,14 @@ class Assistant:
 
     def _verify_click(self):
         if self.pending is None:
+            self.auto_pending = False
             return
         tile_id, cx, cy, rect, before, tray_before, *extra = self.pending
         if game_rect() != rect:
             self.pending = None
+            if self.auto_pending:
+                self.auto_click.set(False)
+                self.auto_pending = False
             self.status.set("游戏窗口位置发生变化，请重试这张牌。")
             return
         try:
@@ -585,7 +678,12 @@ class Assistant:
         if score >= threshold:
             self._accept(tile_id)
         else:
-            self.status.set("没检测到画面变化。若操作已完成，点“确认这步已完成”；否则重试。")
+            if self.auto_pending:
+                self.auto_click.set(False)
+                self.auto_pending = False
+                self.status.set("自动点击未检测到生效，已暂停。请核对游戏画面，再确认这步或重试。")
+            else:
+                self.status.set("没检测到画面变化。若操作已完成，点“确认这步已完成”；否则重试。")
 
     def confirm_pending(self):
         if self.pending:
@@ -600,6 +698,7 @@ class Assistant:
 
     def clear_pending(self):
         self.pending = None
+        self.auto_pending = False
         self.status.set("已清除待确认点击，可以在游戏里重试。")
 
     def manual_sync(self):
@@ -611,6 +710,8 @@ class Assistant:
 
     def _accept(self, tile_id):
         self.pending = None
+        self.auto_pending = False
+        self.auto_next_at = time.monotonic() + 0.25
         try:
             next_state = (self.tool_engine.apply(self.state, tile_id) if self.tool_engine
                           else self.board.move(self.state, tile_id))
@@ -632,10 +733,14 @@ class Assistant:
             self.plan = []
             self.status.set("点击偏离路线，正在从当前局面重新规划…")
             self.replan()
+        if (self.tool_engine.won(self.state) if self.tool_engine
+                else self.board.won(self.state)):
+            self.status.set("路线已完成，请确认游戏显示通关画面。")
         self.render()
 
     def undo(self):
         self.pending = None
+        self.auto_pending = False
         if not self.clicks or not self.board:
             return
         self.clicks.pop()
@@ -668,6 +773,8 @@ class Assistant:
             return
         if self.solving:
             return
+        if self.auto_click.get():
+            self.auto_click.set(False)
         self.solving = True
         board, state = self.board, self.state
         engine = self.tool_engine
@@ -723,8 +830,10 @@ class Assistant:
             self.replan()
             return
         if error:
+            self.search_failed = True
             self.status.set(f"重新规划失败：{error}")
         else:
+            self.search_failed = False
             self.plan = ids
             self.status.set("路线已重新计算并验证。")
             if self.tool_engine:
@@ -753,10 +862,12 @@ class Assistant:
         self.plan = []
         self.clicks = []
         self.pending = None
+        self.auto_pending = False
         self.aux_centers = None
         self.aux_rect = None
         self.stage2_active = False
         self.stage2_hits = 0
+        self.search_failed = False
         self.overlay.withdraw()
         self.target.set("等待第二关")
         self.progress.set("")
@@ -902,6 +1013,7 @@ class Assistant:
         self.aux_rect = None
         self.stage2_active = False
         self.stage2_hits = 0
+        self.search_failed = True
         self.status.set("30 秒内未找到完整路线，这把可能较难。建议点“监听下一局”，再在游戏里重新开一把；也可点“重新规划”继续尝试。这不代表无解。")
         self.render()
 
