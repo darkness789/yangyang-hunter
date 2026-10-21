@@ -20,6 +20,7 @@ from tkinter import messagebox, ttk
 from PIL import ImageChops, ImageGrab, ImageStat
 
 from .board_model import Board, IllegalMove
+from .map_templates import acquire_second_stage_template
 from .solve import depth_search, replay
 from .solve_with_tools import ToolEngine, search_with_tools
 
@@ -169,6 +170,7 @@ class Assistant:
         self.capture_proc = None
         self.capture_stamp = None
         self.solving = False
+        self.preparing = False
         self.search_attempt = 0
         self.last_down = False
         self.rect = None
@@ -258,7 +260,10 @@ class Assistant:
                 self.status.set(f"无法加载道具路线：{exc}")
             return
         if self.args.resume is None:
-            self.status.set("第一关自行完成。请先点“监听下一局”，进入第二关后会自动显示提示。")
+            if (CAPTURES / "recovered_seed.json").is_file():
+                self.status.set("发现本机最近一次开局记录。点“重新规划”可恢复本局，或点“监听下一局”开始新局。")
+            else:
+                self.status.set("第一关自行完成。请先点“监听下一局”，进入第二关后会自动显示提示。")
             self.target.set("等待第二关")
             return
         try:
@@ -644,7 +649,23 @@ class Assistant:
         self.render()
 
     def replan(self):
-        if not self.board or self.solving:
+        if not self.board:
+            if self.preparing:
+                return
+            seed_path = CAPTURES / "recovered_seed.json"
+            if (self.capture_proc is not None and
+                    (not seed_path.is_file() or
+                     seed_path.stat().st_mtime_ns <= self.capture_stamp)):
+                self.status.set("正在等待本局种子，请先进入关卡。")
+                return
+            if not seed_path.is_file():
+                self.status.set("没有本局种子。请点“监听下一局”，再进入关卡。")
+                return
+            self.preparing = True
+            self.status.set("正在从本机抓包记录恢复本局地图并求解…")
+            threading.Thread(target=self._prepare_new_board, daemon=True).start()
+            return
+        if self.solving:
             return
         self.solving = True
         board, state = self.board, self.state
@@ -700,6 +721,9 @@ class Assistant:
         self.render()
 
     def start_capture(self):
+        if self.preparing:
+            self.status.set("当前关卡仍在准备中，请稍候。")
+            return
         if self.capture_proc is not None:
             self.status.set("已经在监听下一局。")
             return
@@ -708,6 +732,21 @@ class Assistant:
             return
         seed_path = CAPTURES / "recovered_seed.json"
         self.capture_stamp = seed_path.stat().st_mtime_ns if seed_path.exists() else 0
+        self.board = None
+        self.tool_engine = None
+        self.map_file = None
+        self.state = None
+        self.plan = []
+        self.clicks = []
+        self.pending = None
+        self.aux_centers = None
+        self.aux_rect = None
+        self.stage2_active = False
+        self.stage2_hits = 0
+        self.overlay.withdraw()
+        self.target.set("等待第二关")
+        self.progress.set("")
+        self.tray.set("")
         self.status.set("正在准备抓取。启动后请在微信小程序中重新进入关卡。")
 
         def work():
@@ -734,12 +773,13 @@ class Assistant:
 
     def _poll_capture(self):
         seed_path = CAPTURES / "recovered_seed.json"
-        if seed_path.exists() and seed_path.stat().st_mtime_ns > self.capture_stamp:
+        if (not self.preparing and seed_path.exists() and
+                seed_path.stat().st_mtime_ns > self.capture_stamp):
             self.capture_stamp = seed_path.stat().st_mtime_ns
-            self.stop_capture()
-            self.status.set("已获取本局种子，正在还原图案并求解…")
+            self.preparing = True
+            self.status.set("已获取本局种子，正在查找或下载第二关地图…")
             threading.Thread(target=self._prepare_new_board, daemon=True).start()
-        elif self.capture_proc.poll() is not None:
+        elif self.capture_proc.poll() is not None and not self.preparing:
             self.capture_proc = None
             self.status.set("抓取已结束。如果尚未拿到种子，请检查代理和证书。")
 
@@ -772,17 +812,11 @@ class Assistant:
     def _prepare_new_board(self):
         try:
             seed = json.loads((CAPTURES / "recovered_seed.json").read_text(encoding="utf-8"))
-            hashes = set(seed["map_md5"])
-            templates = list((PACKAGE_ROOT / "templates").glob("map_*.json"))
-            templates.extend(CAPTURES.glob("map_*.json"))
-            compatible = []
-            for path in templates:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if data.get("sourceMapMd5") in hashes:
-                    compatible.append((sum(len(layer) for layer in data["levelData"].values()), path))
-            if not compatible:
-                raise ValueError("本局地图模板与本机保存的模板不同，需重新抓取 .map 文件")
-            _, template = max(compatible)
+            template = acquire_second_stage_template(
+                seed, PACKAGE_ROOT / "templates", CAPTURES,
+                wait_seconds=8 if self.capture_proc is not None else 0)
+            self.root.after(0, self.stop_capture)
+            self.root.after(0, lambda: self.status.set("地图已准备好，正在还原牌面并求解…"))
             typed = CAPTURES / "typed_current.json"
             subprocess.run(["node", str(SCRIPTS / "restore_types.js"),
                             str(template), str(CAPTURES / "recovered_seed.json"), str(typed)],
@@ -817,7 +851,11 @@ class Assistant:
                 return
             self.root.after(0, lambda: self._load_unsolved(typed))
         except Exception as exc:
-            self.root.after(0, lambda error=str(exc): self.status.set(f"新关卡准备失败：{error}"))
+            self.root.after(0, self.stop_capture)
+            self.root.after(0, lambda error=str(exc): self.status.set(
+                f"新关卡准备失败：{error}。可点“重新规划”重试本局。"))
+        finally:
+            self.root.after(0, lambda: setattr(self, "preparing", False))
 
     def _load_unsolved(self, path):
         self.board = Board.from_json(path)

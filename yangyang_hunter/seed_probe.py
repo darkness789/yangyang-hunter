@@ -136,12 +136,15 @@ class SeedProbe:
                 plaintext = bytes(a ^ b for a, b in zip(ciphertext, stream))
                 seed = decode_seed_ack(plaintext)
                 OUTPUT.mkdir(parents=True, exist_ok=True)
-                (OUTPUT / "recovered_seed.json").write_text(json.dumps({
+                target = OUTPUT / "recovered_seed.json"
+                temporary = OUTPUT / "recovered_seed.json.tmp"
+                temporary.write_text(json.dumps({
                     "map_md5": flow.metadata.pop("ylgy_probe_map_md5"),
                     "map_seed": seed["mapSeed"],
                     "map_seed_2": seed["mapSeed2"],
                     "method": "one-start AES-OFB known-plaintext probe",
                 }, ensure_ascii=False, indent=2), encoding="utf-8")
+                temporary.replace(target)
                 print("[seed-probe] Recovered current board seed; saved recovered_seed.json", flush=True)
             except Exception as exc:
                 print(f"[seed-probe] Response decode failed: {type(exc).__name__}: {exc}", flush=True)
