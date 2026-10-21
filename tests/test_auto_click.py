@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from yangyang_hunter.board_model import Board, Tile
+from yangyang_hunter.solve_with_tools import ToolEngine
 from yangyang_hunter import desktop_assistant as ui
 
 
@@ -39,6 +40,9 @@ class FakeUser32:
     def GetParent(self, *_):
         return 2
 
+    def SetForegroundWindow(self, *_):
+        return True
+
 
 class AutoClickTests(unittest.TestCase):
     def assistant(self, action="0"):
@@ -70,12 +74,45 @@ class AutoClickTests(unittest.TestCase):
                          [("button", 0x0002), ("button", 0x0004)])
 
     def test_tool_action_waits_for_player(self):
+        for action in ("MOVE_OUT", "REVIVE"):
+            with self.subTest(action=action):
+                assistant = self.assistant(action)
+                fake = FakeUser32()
+                with patch.object(ui, "user32", fake):
+                    assistant._poll_auto()
+                self.assertEqual(fake.events, [])
+                self.assertFalse(assistant.auto_click.get())
+                self.assertIn("自行重新开启", assistant.status.get())
+
+    def test_auto_stays_off_after_manually_using_tool(self):
+        assistant = self.assistant()
+        assistant.board = Board([Tile(str(i), 1, i * 8, 0, 1, 1)
+                                 for i in range(3)])
+        assistant.tool_engine = ToolEngine(assistant.board)
+        assistant.state = assistant.tool_engine.initial()
+        assistant.plan = ["0", "MOVE_OUT", "1"]
+        assistant.clicks = []
+        assistant.render = lambda: None
+        assistant.auto_track = Value(True)
+
+        assistant._accept("0")
+        self.assertFalse(assistant.auto_click.get())
+        self.assertEqual(assistant.plan[0], "MOVE_OUT")
+        assistant._accept("MOVE_OUT")
+        self.assertFalse(assistant.auto_click.get())
+        self.assertEqual(assistant.plan[0], "1")
+
+        assistant.auto_click.set(True)
+        with patch.object(ui, "user32", FakeUser32()):
+            assistant._auto_mode_changed()
+        self.assertTrue(assistant.auto_click.get())
+
+    def test_cannot_enable_auto_while_tool_is_next(self):
         assistant = self.assistant("MOVE_OUT")
-        fake = FakeUser32()
-        with patch.object(ui, "user32", fake):
-            assistant._poll_auto()
-        self.assertEqual(fake.events, [])
-        self.assertIn("手动", assistant.status.get())
+        assistant.auto_track = Value(True)
+        assistant._auto_mode_changed()
+        self.assertFalse(assistant.auto_click.get())
+        self.assertIn("移出", assistant.status.get())
 
     def test_auto_click_stops_when_game_does_not_change(self):
         assistant = self.assistant()

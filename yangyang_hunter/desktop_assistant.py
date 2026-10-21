@@ -448,10 +448,20 @@ class Assistant:
                  top + (y-old_top)*height/old_height)
                 for x, y in self.aux_centers]
 
+    def _pause_auto_for_tool(self, action):
+        self.auto_click.set(False)
+        if action == "MOVE_OUT":
+            self.status.set("下一步需手动使用“移出”。自动点击已关闭；使用完后请自行重新开启。")
+        else:
+            self.status.set("下一步需手动使用“复活”并点“确认这步已完成”。自动点击已关闭；完成后请自行重新开启。")
+
     def _auto_mode_changed(self):
         self.auto_next_at = time.monotonic() + 0.35
         if not self.auto_click.get():
             self.status.set("自动点击已关闭。")
+            return
+        if self.plan and self.plan[0] in ("MOVE_OUT", "REVIVE"):
+            self._pause_auto_for_tool(self.plan[0])
             return
         self.auto_track.set(True)
         hwnd = user32.FindWindowW(None, TITLE)
@@ -472,10 +482,7 @@ class Assistant:
             return
         action = self.plan[0]
         if action in ("MOVE_OUT", "REVIVE"):
-            hint = ("请手动使用“移出”道具，自动点击会在识别后继续。" if action == "MOVE_OUT"
-                    else "请手动使用“复活”并点“确认这步已完成”，自动点击随后继续。")
-            if self.status.get() != hint:
-                self.status.set(hint)
+            self._pause_auto_for_tool(action)
             return
         rect = game_rect()
         hwnd = user32.FindWindowW(None, TITLE)
@@ -728,7 +735,10 @@ class Assistant:
         self.clicks.append(tile_id)
         if self.plan and tile_id == self.plan[0]:
             self.plan.pop(0)
-            if self.plan and self.plan[0] == "REVIVE":
+            if (self.plan and self.plan[0] in ("MOVE_OUT", "REVIVE")
+                    and self.auto_click.get()):
+                self._pause_auto_for_tool(self.plan[0])
+            elif self.plan and self.plan[0] == "REVIVE":
                 self.status.set("完成屏幕提示的操作后，按“确认这步已完成”。")
             else:
                 self.status.set("已识别操作，下一步已标出。")
