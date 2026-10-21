@@ -1,6 +1,6 @@
 import unittest
 
-from board_model import Board, IllegalMove, State, Tile
+from yangyang_hunter.board_model import Board, IllegalMove, State, Tile
 
 
 def tile(number, kind, x=0, y=0, layer=1):

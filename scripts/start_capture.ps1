@@ -8,13 +8,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$projectRoot = Split-Path -Parent $PSScriptRoot
 $mitmdump = 'C:\Program Files\mitmproxy\bin\mitmdump.exe'
 if (-not (Test-Path -LiteralPath $mitmdump)) {
     throw "mitmdump not found: $mitmdump"
 }
 
-$env:YLGY_CAPTURE_DIR = Join-Path $PSScriptRoot 'captures'
-$addon = Join-Path $PSScriptRoot 'capture_map.py'
+$env:YLGY_CAPTURE_DIR = Join-Path $projectRoot 'captures'
+$addon = Join-Path $projectRoot 'yangyang_hunter\capture_map.py'
 
 if ($Mode -eq 'local') {
     Write-Host "Capturing $ProcessName traffic to $env:YLGY_CAPTURE_DIR"
@@ -39,7 +40,7 @@ $settings = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 $old = Get-ItemProperty -Path $settings
 $oldEnabled = [int]$old.ProxyEnable
 $oldServer = [string]$old.ProxyServer
-$stateFile = Join-Path $PSScriptRoot 'captures\proxy_state.json'
+$stateFile = Join-Path $projectRoot 'captures\proxy_state.json'
 if (Get-NetTCPConnection -LocalPort $ListenPort -State Listen -ErrorAction SilentlyContinue) {
     throw "Port $ListenPort is already in use"
 }
@@ -55,12 +56,12 @@ try {
     Write-Host "Capturing for $DurationSeconds seconds via 127.0.0.1:$ListenPort; upstream $UpstreamProxy"
     Write-Host "Output: $env:YLGY_CAPTURE_DIR"
     Write-Host 'Open or restart 羊了个羊：星球, then enter a level.'
-    $stdout = Join-Path $PSScriptRoot 'captures\mitmdump.stdout.log'
-    $stderr = Join-Path $PSScriptRoot 'captures\mitmdump.stderr.log'
+    $stdout = Join-Path $projectRoot 'captures\mitmdump.stdout.log'
+    $stderr = Join-Path $projectRoot 'captures\mitmdump.stderr.log'
     $arguments = @('--mode', "upstream:$UpstreamProxy", '--listen-host', '127.0.0.1', '--listen-port', "$ListenPort", '-s', $addon, '--set', 'flow_detail=0')
-    if ($SeedProbe) { $arguments += @('-s', (Join-Path $PSScriptRoot 'seed_probe.py')) }
+    if ($SeedProbe) { $arguments += @('-s', (Join-Path $projectRoot 'yangyang_hunter\seed_probe.py')) }
     $captureProcess = Start-Process -FilePath $mitmdump -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-    $pidFile = Join-Path $PSScriptRoot 'captures\mitmdump.pid'
+    $pidFile = Join-Path $projectRoot 'captures\mitmdump.pid'
     Set-Content -LiteralPath $pidFile -Value $captureProcess.Id
     Wait-Process -Id $captureProcess.Id -Timeout $DurationSeconds -ErrorAction SilentlyContinue
 } finally {
@@ -70,7 +71,7 @@ try {
     Set-ItemProperty -Path $settings -Name ProxyServer -Value $oldServer
     Set-ItemProperty -Path $settings -Name ProxyEnable -Value $oldEnabled
     [WinInetProxyRefresh]::Refresh()
-    Remove-Item -LiteralPath (Join-Path $PSScriptRoot 'captures\mitmdump.pid') -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $projectRoot 'captures\mitmdump.pid') -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stateFile -ErrorAction SilentlyContinue
     Write-Host 'Previous Windows proxy settings restored.'
 }

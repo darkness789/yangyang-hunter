@@ -4,7 +4,7 @@ const fs = require('node:fs');
 
 const [,, mapPath, seedPath, outputPath] = process.argv;
 if (!mapPath || !seedPath || !outputPath) {
-  process.stderr.write('Usage: node tools/restore_types.js map.json recovered_seed.json typed_map.json\n');
+  process.stderr.write('Usage: node scripts/restore_types.js map.json recovered_seed.json typed_map.json\n');
   process.exit(2);
 }
 const map = JSON.parse(fs.readFileSync(mapPath, 'utf8'));

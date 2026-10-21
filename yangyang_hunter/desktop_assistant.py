@@ -19,13 +19,15 @@ from tkinter import messagebox, ttk
 
 from PIL import ImageChops, ImageGrab, ImageStat
 
-from board_model import Board, IllegalMove
-from solve import depth_search, replay
-from solve_with_tools import ToolEngine, search_with_tools
+from .board_model import Board, IllegalMove
+from .solve import depth_search, replay
+from .solve_with_tools import ToolEngine, search_with_tools
 
 
-ROOT = Path(__file__).resolve().parent
+PACKAGE_ROOT = Path(__file__).resolve().parent
+ROOT = PACKAGE_ROOT.parent
 CAPTURES = ROOT / "captures"
+SCRIPTS = ROOT / "scripts"
 TITLE = "\u7f8a\u4e86\u4e2a\u7f8a\uff1a\u661f\u7403"
 ICON_NAMES = {
     1: "青草", 2: "胡萝卜", 3: "玉米", 5: "叉子", 6: "白菜",
@@ -701,7 +703,7 @@ class Assistant:
         if self.capture_proc is not None:
             self.status.set("已经在监听下一局。")
             return
-        if not (ROOT / "start_capture.ps1").exists():
+        if not (SCRIPTS / "start_capture.ps1").exists():
             self.status.set("找不到抓取脚本。")
             return
         seed_path = CAPTURES / "recovered_seed.json"
@@ -711,11 +713,11 @@ class Assistant:
         def work():
             try:
                 subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                                "-File", str(ROOT / "install_capture_cert.ps1")],
+                                "-File", str(SCRIPTS / "install_capture_cert.ps1")],
                                check=True, capture_output=True, text=True, timeout=45)
                 flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 proc = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy",
-                                         "Bypass", "-File", str(ROOT / "start_capture.ps1"),
+                                         "Bypass", "-File", str(SCRIPTS / "start_capture.ps1"),
                                          "-SeedProbe", "-DurationSeconds", "600"],
                                         cwd=ROOT, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.PIPE, creationflags=flags)
@@ -762,7 +764,7 @@ class Assistant:
             except subprocess.TimeoutExpired:
                 proc.terminate()
             subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                            "-File", str(ROOT / "remove_capture_cert.ps1")],
+                            "-File", str(SCRIPTS / "remove_capture_cert.ps1")],
                            capture_output=True, timeout=15)
 
         threading.Thread(target=work, daemon=True).start()
@@ -771,7 +773,7 @@ class Assistant:
         try:
             seed = json.loads((CAPTURES / "recovered_seed.json").read_text(encoding="utf-8"))
             hashes = set(seed["map_md5"])
-            templates = list((ROOT / "templates").glob("map_*.json"))
+            templates = list((PACKAGE_ROOT / "templates").glob("map_*.json"))
             templates.extend(CAPTURES.glob("map_*.json"))
             compatible = []
             for path in templates:
@@ -782,7 +784,7 @@ class Assistant:
                 raise ValueError("本局地图模板与本机保存的模板不同，需重新抓取 .map 文件")
             _, template = max(compatible)
             typed = CAPTURES / "typed_current.json"
-            subprocess.run(["node", str(ROOT / "tools" / "restore_types.js"),
+            subprocess.run(["node", str(SCRIPTS / "restore_types.js"),
                             str(template), str(CAPTURES / "recovered_seed.json"), str(typed)],
                            check=True, capture_output=True, text=True, timeout=30)
             board = Board.from_json(typed)

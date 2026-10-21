@@ -7,7 +7,7 @@ const path = require('node:path');
 
 const [,, input, appid, output] = process.argv;
 if (!input || !/^wx[0-9a-f]{16}$/i.test(appid || '') || !output) {
-  process.stderr.write('Usage: node tools/unpack_wxapkg.js package.wxapkg wx<16hex> output_dir\n');
+  process.stderr.write('Usage: node scripts/unpack_wxapkg.js package.wxapkg wx<16hex> output_dir\n');
   process.exit(2);
 }
 

@@ -12,8 +12,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from board_model import Board, IllegalMove
-from solve import _available, _unlock_targets, _after_move
+from .board_model import Board, IllegalMove
+from .solve import _available, _unlock_targets, _after_move
 
 
 def insert_tray(tray, kind):

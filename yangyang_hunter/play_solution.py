@@ -12,8 +12,8 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from board_model import Board
-from solve import replay
+from .board_model import Board
+from .solve import replay
 
 
 WINDOW_TITLE = "羊了个羊：星球"

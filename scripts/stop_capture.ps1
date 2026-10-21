@@ -1,6 +1,7 @@
 $settings = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-$pidFile = Join-Path $PSScriptRoot 'captures\mitmdump.pid'
-$stateFile = Join-Path $PSScriptRoot 'captures\proxy_state.json'
+$projectRoot = Split-Path -Parent $PSScriptRoot
+$pidFile = Join-Path $projectRoot 'captures\mitmdump.pid'
+$stateFile = Join-Path $projectRoot 'captures\proxy_state.json'
 if (Test-Path -LiteralPath $pidFile) {
     $capturePid = [int](Get-Content -LiteralPath $pidFile -Raw)
     Stop-Process -Id $capturePid -ErrorAction SilentlyContinue

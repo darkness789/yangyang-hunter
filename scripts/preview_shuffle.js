@@ -1,5 +1,5 @@
 // Predict the classic client's first shuffle from the captured map seed.
-// Usage: node tools/preview_shuffle.js template.json seed.json output.json
+// Usage: node scripts/preview_shuffle.js template.json seed.json output.json
 const fs = require('node:fs');
 const [,, mapPath, seedPath, outputPath] = process.argv;
 if (!mapPath || !seedPath || !outputPath) {

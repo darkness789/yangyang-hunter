@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from board_model import Board
+from .board_model import Board
 
 
 @dataclass(frozen=True)

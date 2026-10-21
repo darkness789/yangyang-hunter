@@ -5,8 +5,8 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-from board_model import Board, IllegalMove
-from solve import depth_search, replay
+from .board_model import Board, IllegalMove
+from .solve import depth_search, replay
 
 
 class Session:
