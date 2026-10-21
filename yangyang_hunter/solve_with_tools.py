@@ -6,6 +6,7 @@ planned in advance: its result is random and requires a fresh board reading.
 """
 
 import argparse
+import heapq
 import json
 import random
 import time
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .board_model import Board, IllegalMove
-from .solve import _available, _unlock_targets, _after_move
+from .solve import _available, _unlock_targets, _after_move, _bits, _available_mask
 
 
 def insert_tray(tray, kind):
@@ -180,7 +181,14 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
         def priority(index):
             tile = board.tiles[index]
             held = counts.get(tile.type, 0)
-            return (100 if held == 2 else 50 if held else 0) + tile.layer * 2
+            remaining = board.all_mask & ~removed & ~(1 << index)
+            unlocks = sum(1 for lower in _bits(unlock_targets[index] & remaining)
+                          if not (board.blockers[lower] & remaining))
+            score = (100 if held == 2 else 50 if held else 0)
+            score += tile.layer * 2 + unlocks * 8
+            if seed:
+                score += randomizer.uniform(-18, 18)
+            return score
 
         choices.sort(key=priority, reverse=True)
         choices = choices[:max_branches]
@@ -230,6 +238,158 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
                          (path if result == "solved" else best)),
             "elapsed": time.monotonic() - start, "states": nodes,
             "limit": result if result != "solved" else None}
+
+
+def diverse_beam_search(board, seconds=90, width=1200, seed=0,
+                        initial_state=None, allow_remove=True, allow_revive=True):
+    """Search complete tool routes while keeping alternatives at each click depth.
+
+    The frontier is grouped by board clicks. Tool and auxiliary actions have
+    zero click cost, so they are expanded within the current depth. Exact
+    states are deduplicated, while a quota for each tray shape prevents one
+    promising-looking opening from taking the entire beam.
+    """
+    if any(tile.type <= 0 for tile in board.tiles):
+        raise ValueError("Every tile needs a recovered nonzero type")
+    if width < 1 or seconds <= 0:
+        raise ValueError("width and seconds must be positive")
+    start = time.monotonic()
+    deadline = start + seconds
+    rng = random.Random(seed)
+    types = tuple(tile.type for tile in board.tiles)
+    unlock_targets = _unlock_targets(board)
+    if initial_state is None:
+        initial_state = (0, (), ((), (), ()), False, False)
+    removed, tray, aux, used_remove, used_revive = initial_state
+    available = _available_mask(board, removed)
+    # A node is (removed, available, tray, aux, used_remove, used_revive, path).
+    frontier = [(removed, available, tray, aux, used_remove, used_revive, ())]
+    target_depth = len(board.tiles) - bin(removed).count("1")
+    expanded = 0
+    best = ()
+    reached = 0
+
+    def rank(node):
+        removed, available, tray, aux, used_remove, used_revive, path = node
+        held = {}
+        for kind in tray:
+            held[kind] = held.get(kind, 0) + 1
+        free = {}
+        for index in _bits(available):
+            kind = types[index]
+            free[kind] = free.get(kind, 0) + 1
+        # Empty slots and immediately finishable pairs matter more than a
+        # small difference in the number of visible cards.
+        matches = sum(min(n, 3 - held[k]) for k, n in free.items() if k in held)
+        exposed_triples = sum((n + held.get(k, 0)) // 3 for k, n in free.items())
+        aux_count = sum(map(len, aux))
+        return (-31 * len(tray) - 13 * aux_count + 11 * matches +
+                8 * exposed_triples + 0.7 * bin(available).count("1") +
+                (65 if not used_remove else 0) +
+                (45 if not used_revive else 0) + rng.random() * 18)
+
+    def key(node):
+        return (node[0], node[2], node[3], node[4], node[5])
+
+    for depth in range(target_depth + 1):
+        if not frontier or time.monotonic() >= deadline:
+            break
+        reached = depth
+        next_states = {}
+        pending = frontier
+        seen_here = set()
+        # Zero-click actions are expanded before advancing to the next board
+        # depth. A state can use each tool once and auxiliary cards are finite.
+        while pending and time.monotonic() < deadline:
+            node = pending.pop()
+            removed, available, tray, aux, used_remove, used_revive, path = node
+            state_key = key(node)
+            if state_key in seen_here:
+                continue
+            seen_here.add(state_key)
+            expanded += 1
+            if len(path) > len(best):
+                best = path
+            if removed == board.all_mask and not tray and not any(aux):
+                return {"status": "solved", "path": path, "depth": depth,
+                        "elapsed": time.monotonic() - start, "states": expanded}
+            if len(tray) == 7:
+                if allow_revive and not used_revive:
+                    shifted = tuple(aux[i] + (tray[i],) for i in range(3))
+                    pending.append((removed, available, tray[3:], shifted,
+                                    used_remove, True, path + ("REVIVE",)))
+                continue
+            if allow_remove and not used_remove and len(tray) >= 4:
+                count = min(3, len(tray))
+                shifted = tuple(aux[i] + ((tray[i],) if i < count else ())
+                                for i in range(3))
+                pending.append((removed, available, tray[count:], shifted,
+                                True, used_revive, path + ("MOVE_OUT",)))
+            for slot, stack in enumerate(aux):
+                if not stack:
+                    continue
+                if stack[-1] not in tray and len(tray) > 2 and removed != board.all_mask:
+                    continue
+                next_tray = insert_tray(tray, stack[-1])
+                if len(next_tray) == 7 and (used_revive or not allow_revive):
+                    continue
+                shifted = tuple(s[:-1] if i == slot else s
+                                for i, s in enumerate(aux))
+                pending.append((removed, available, next_tray, shifted,
+                                used_remove, used_revive, path + (("AUX", slot),)))
+            for index in _bits(available):
+                next_tray = insert_tray(tray, types[index])
+                if len(next_tray) == 7 and (used_revive or not allow_revive):
+                    continue
+                next_removed, next_available = _after_move(
+                    board, unlock_targets, removed, available, index)
+                child = (next_removed, next_available, next_tray, aux,
+                         used_remove, used_revive, path + (index,))
+                child_key = key(child)
+                if child_key not in next_states:
+                    next_states[child_key] = child
+            if expanded % 512 == 0 and time.monotonic() >= deadline:
+                break
+        if not next_states:
+            break
+        # The tray signature quota preserves different ways of handling the
+        # next layers even when their heuristic scores are close.
+        cohorts = {(False, False): [], (True, False): [],
+                   (False, True): [], (True, True): []}
+        for node in next_states.values():
+            cohorts[(node[4], node[5])].append(node)
+        frontier = []
+        leftovers = []
+        quota = max(4, width // 45)
+        shares = {(False, False): 0.45, (True, False): 0.25,
+                  (False, True): 0.10, (True, True): 0.20}
+        for status, group in cohorts.items():
+            if not group:
+                continue
+            ranked = heapq.nlargest(min(width * 4, len(group)), group, key=rank)
+            shape_counts = {}
+            reserved = max(1, int(width * shares[status]))
+            taken = 0
+            for node in ranked:
+                shape = tuple(sorted(node[2]))
+                if shape_counts.get(shape, 0) >= quota:
+                    leftovers.append(node)
+                    continue
+                shape_counts[shape] = shape_counts.get(shape, 0) + 1
+                if taken < reserved:
+                    frontier.append(node)
+                    taken += 1
+                else:
+                    leftovers.append(node)
+                if len(frontier) >= width:
+                    break
+        if len(frontier) < width:
+            frontier.extend(heapq.nlargest(width - len(frontier), leftovers,
+                                          key=rank))
+    return {"status": "not_found", "path": best,
+            "depth": reached,
+            "elapsed": time.monotonic() - start, "states": expanded,
+            "limit": "timeout" if time.monotonic() >= deadline else "search_exhausted"}
 
 
 def replay_with_tools(board, path):

@@ -22,7 +22,7 @@ from PIL import ImageChops, ImageGrab, ImageStat
 from .board_model import Board, IllegalMove
 from .map_templates import acquire_second_stage_template
 from .solve import depth_search, replay
-from .solve_with_tools import ToolEngine, search_with_tools
+from .solve_with_tools import ToolEngine, diverse_beam_search, search_with_tools
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -681,6 +681,14 @@ class Assistant:
                                                max_states=4_000_000,
                                                max_branches=8, seed=attempt,
                                                initial_state=engine.search_start(state))
+                    if result["status"] != "solved":
+                        self.root.after(0, lambda: self.status.set(
+                            "深度搜索未找到路线，正在尝试多局面搜索…"))
+                        result = diverse_beam_search(
+                            board, seconds=90, width=600, seed=attempt,
+                            initial_state=engine.search_start(state),
+                            allow_remove=not state.used_remove,
+                            allow_revive=not state.used_revive)
                     ids = [board.tiles[item].id if isinstance(item, int) else item
                            for item in result["path"]]
                     check = state
@@ -823,18 +831,28 @@ class Assistant:
                            check=True, capture_output=True, text=True, timeout=30)
             board = Board.from_json(typed)
             engine = ToolEngine(board)
+            beam_prefix = ()
             for attempt, seed in enumerate((0, 2, 1, 3, 4), 1):
                 self.root.after(0, lambda n=attempt: self.status.set(
                     f"正在搜索第 {n}/5 组路线（必要时使用移出和复活）…"))
+                branches = (6, 8, 10, None, None)[attempt - 1]
                 normal = depth_search(board, seconds=30, seed=seed,
-                                      max_branches=6, max_states=1_500_000)
+                                      max_branches=branches, max_states=1_500_000)
+                if attempt == 1:
+                    beam_prefix = normal["path"][:len(normal["path"]) // 3]
                 if normal["status"] == "solved":
                     actions = [board.tiles[index].id for index in normal["path"]]
                 else:
+                    # A longest ordinary prefix can already be doomed. Try
+                    # tool planning before that point on alternating retries.
+                    prefix = normal["path"]
+                    if attempt > 1:
+                        prefix = prefix[:max(0, len(prefix) *
+                                             (60 if attempt % 2 else 80) // 100)]
                     planned = search_with_tools(board, seconds=40,
                                                 max_states=2_000_000,
-                                                max_branches=8, seed=seed,
-                                                prefix=normal["path"])
+                                                max_branches=(8 if attempt < 4 else None),
+                                                seed=seed, prefix=prefix)
                     if planned["status"] != "solved":
                         continue
                     actions = [board.tiles[item].id if isinstance(item, int) else item
@@ -849,6 +867,27 @@ class Assistant:
                     "map_file": str(typed)}, ensure_ascii=False, indent=2), encoding="utf-8")
                 self.root.after(0, lambda route=actions: self.load_tool_board(typed, route))
                 return
+            self.root.after(0, lambda: self.status.set(
+                "深度搜索未找到路线，正在尝试多局面搜索…"))
+            prefix_state = engine.initial()
+            for index in beam_prefix:
+                prefix_state = engine.apply(prefix_state, board.tiles[index].id)
+            planned = diverse_beam_search(board, seconds=100, width=700,
+                                          seed=7,
+                                          initial_state=engine.search_start(prefix_state))
+            if planned["status"] == "solved":
+                actions = ([board.tiles[index].id for index in beam_prefix] +
+                           [board.tiles[item].id if isinstance(item, int) else item
+                            for item in planned["path"]])
+                check = engine.initial()
+                for action in actions:
+                    check = engine.apply(check, action)
+                if engine.won(check):
+                    (CAPTURES / "solution_current.json").write_text(json.dumps({
+                        "status": "solved", "verified": True, "actions": actions,
+                        "map_file": str(typed)}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    self.root.after(0, lambda route=actions: self.load_tool_board(typed, route))
+                    return
             self.root.after(0, lambda: self._load_unsolved(typed))
         except Exception as exc:
             self.root.after(0, self.stop_capture)

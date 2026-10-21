@@ -125,6 +125,14 @@ def depth_search(board, seconds=60, seed=0, initial_state=None,
             score += tile.layer * 2
             if sum(tray) >= 5 and held:
                 score += 40
+            # Reward cards that reveal new choices. With a nonzero seed,
+            # perturb nearby scores so retries visit genuinely different
+            # branches instead of merely changing the order of exact ties.
+            remaining = board.all_mask & ~removed & ~(1 << index)
+            score += 8 * sum(1 for lower in _bits(unlock_targets[index] & remaining)
+                             if not (board.blockers[lower] & remaining))
+            if seed:
+                score += randomizer.uniform(-18, 18)
             return score
 
         choices.sort(key=priority, reverse=True)
