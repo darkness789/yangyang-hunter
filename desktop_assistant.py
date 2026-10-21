@@ -1,0 +1,856 @@
+"""Windows desktop overlay for manually playing Sheep Planet solutions.
+
+Only observes mouse input and screenshots; it never sends game clicks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from collections import Counter
+from pathlib import Path
+from tkinter import messagebox, ttk
+
+from PIL import ImageChops, ImageGrab, ImageStat
+
+from board_model import Board, IllegalMove
+from solve import depth_search, replay
+from solve_with_tools import ToolEngine, search_with_tools
+
+
+ROOT = Path(__file__).resolve().parent
+CAPTURES = ROOT / "captures"
+TITLE = "\u7f8a\u4e86\u4e2a\u7f8a\uff1a\u661f\u7403"
+ICON_NAMES = {
+    1: "青草", 2: "胡萝卜", 3: "玉米", 5: "叉子", 6: "白菜",
+    7: "羊毛", 8: "蓝刷", 9: "剪刀", 10: "牛奶", 11: "红桶",
+    12: "蓝手套", 13: "铃铛", 14: "火堆", 15: "毛线", 16: "干草",
+}
+
+user32 = ctypes.windll.user32
+user32.FindWindowW.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p)
+user32.FindWindowW.restype = ctypes.c_void_p
+user32.GetForegroundWindow.restype = ctypes.c_void_p
+user32.GetParent.argtypes = (ctypes.c_void_p,)
+user32.GetParent.restype = ctypes.c_void_p
+user32.GetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int)
+user32.SetWindowLongW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_long)
+user32.SetLayeredWindowAttributes.argtypes = (
+    ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ubyte, ctypes.c_ulong)
+try:
+    user32.SetProcessDPIAware()
+except OSError:
+    pass
+
+
+class Point(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class Rect(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+def game_rect():
+    hwnd = user32.FindWindowW(None, TITLE)
+    if not hwnd or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+        return None
+    rect = Rect()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+
+
+def cursor():
+    point = Point()
+    user32.GetCursorPos(ctypes.byref(point))
+    return point.x, point.y
+
+
+def tile_center(tile, rect):
+    left, top, width, height = rect
+    return (left + (110 + 6.3 * tile.x) * width / 573,
+            top + (300 + 6.25 * tile.y) * height / 1067)
+
+
+def crop_at(x, y, radius=20):
+    return ImageGrab.grab(bbox=(int(x - radius), int(y - radius),
+                                int(x + radius), int(y + radius))).convert("RGB")
+
+
+def change_score(before, after):
+    if before is None or after is None:
+        return 0.0
+    return sum(ImageStat.Stat(ImageChops.difference(before, after)).mean) / 3
+
+
+def aux_area(rect):
+    """The space between the board and the tray where moved cards appear."""
+    left, top, width, height = rect
+    return (int(left + 20*width/573), int(top + 690*height/1067),
+            int(left + 553*width/573), int(top + 824*height/1067))
+
+
+def find_aux_centers(before, after, rect):
+    """Locate the three cards added by the move-out tool from image changes."""
+    if before is None or after is None or before.size != after.size:
+        return None
+    diff = ImageChops.difference(before, after).convert("L")
+    width, height = diff.size
+    pixels = diff.load()
+    activity = [sum(pixels[x, y] > 30 for y in range(height)) for x in range(width)]
+    runs = []
+    start = None
+    for x, count in enumerate(activity + [0]):
+        if count >= max(8, height//12) and start is None:
+            start = x
+        elif count < max(8, height//12) and start is not None:
+            if x-start >= max(16, int(22*rect[2]/573)):
+                runs.append((start, x))
+            start = None
+    if len(runs) != 3:
+        return None
+    box = aux_area(rect)
+    centers = []
+    for x0, x1 in runs:
+        points = [(x, y) for x in range(x0, x1) for y in range(height)
+                  if pixels[x, y] > 30]
+        if not points:
+            return None
+        centers.append((box[0] + sum(x for x, _ in points)/len(points),
+                        box[1] + sum(y for _, y in points)/len(points)))
+    return centers
+
+
+def second_stage_visible(image):
+    """The second map has two stacks at row 0; the first map has none.
+
+    ``image`` is a 573x1067 screenshot of the game window. Sampling the
+    left and right stack backs avoids relying on tile pictures or text.
+    """
+    if image.size != (573, 1067):
+        image = image.resize((573, 1067))
+    samples = ((125, 285), (125, 300), (145, 285), (145, 300),
+               (425, 285), (425, 300), (445, 285), (445, 300))
+    dark = sum(1 for x, y in samples if max(image.getpixel((x, y))[:3]) < 185)
+    return dark >= 6
+
+
+def current_stage_is_second(rect):
+    if not rect:
+        return False
+    left, top, width, height = rect
+    image = ImageGrab.grab(bbox=(left, top, left+width, top+height)).convert("RGB")
+    return second_stage_visible(image)
+
+
+class Assistant:
+    def __init__(self, root, args):
+        self.root = root
+        self.args = args
+        self.board = None
+        self.tool_engine = None
+        self.map_file = None
+        self.state = None
+        self.clicks = []
+        self.plan = []
+        self.pending = None
+        self.aux_centers = None
+        self.aux_rect = None
+        self.capture_proc = None
+        self.capture_stamp = None
+        self.solving = False
+        self.search_attempt = 0
+        self.last_down = False
+        self.rect = None
+        self.focus_active = None
+        self.stage2_active = False
+        self.stage2_hits = 0
+        self.last_stage_check = 0.0
+        self.status = tk.StringVar(value="正在读取已保存关卡…")
+        self.progress = tk.StringVar(value="")
+        self.target = tk.StringVar(value="")
+        self.tray = tk.StringVar(value="")
+        self.overlay_enabled = tk.BooleanVar(value=True)
+        self.auto_track = tk.BooleanVar(value=True)
+        self._build_ui()
+        self.root.after(150, self._initial_load)
+        self.root.after(60, self._poll)
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+
+    def _build_ui(self):
+        self.root.title("羊了个羊星球 · 通关辅助")
+        game = game_rect()
+        x = game[0] + game[2] + 16 if game else 620
+        y = game[1] if game else 130
+        self.root.geometry(f"410x330+{x}+{y}")
+        self.root.attributes("-topmost", True)
+        main = ttk.Frame(self.root, padding=14)
+        main.pack(fill="both", expand=True)
+        ttk.Label(main, text="下一张牌", font=("Microsoft YaHei UI", 11)).pack(anchor="w")
+        ttk.Label(main, textvariable=self.target, font=("Microsoft YaHei UI", 22, "bold"),
+                  foreground="#1268a3").pack(anchor="w", pady=(2, 8))
+        ttk.Label(main, textvariable=self.progress).pack(anchor="w")
+        ttk.Label(main, textvariable=self.tray).pack(anchor="w", pady=(4, 10))
+        ttk.Label(main, textvariable=self.status, wraplength=380,
+                  foreground="#555555").pack(anchor="w", pady=(0, 12))
+        row = ttk.Frame(main)
+        row.pack(fill="x", pady=2)
+        ttk.Button(row, text="撤销识别", command=self.undo).pack(side="left")
+        ttk.Button(row, text="重新规划", command=self.replan).pack(side="left", padx=5)
+        ttk.Button(row, text="确认这步已完成", command=self.confirm_pending).pack(side="left")
+        row2 = ttk.Frame(main)
+        row2.pack(fill="x", pady=5)
+        ttk.Button(row2, text="监听下一局", command=self.start_capture).pack(side="left")
+        ttk.Button(row2, text="停止监听", command=self.stop_capture).pack(side="left", padx=5)
+        ttk.Checkbutton(row2, text="显示标记", variable=self.overlay_enabled).pack(side="left")
+        ttk.Checkbutton(main, text="自动识别我在游戏中的点击", variable=self.auto_track).pack(anchor="w")
+        row3 = ttk.Frame(main)
+        row3.pack(fill="x", pady=(6, 0))
+        self.manual_choice = tk.StringVar()
+        self.manual_choices = {}
+        self.manual_picker = ttk.Combobox(row3, textvariable=self.manual_choice,
+                                          state="readonly", width=13)
+        self.manual_picker.pack(side="left")
+        ttk.Button(row3, text="补记这张牌", command=self.manual_sync).pack(side="left", padx=5)
+        ttk.Button(row3, text="重试", command=self.clear_pending).pack(side="left")
+        self.root.geometry(f"410x390+{x}+{y}")
+        self.overlay = tk.Toplevel(self.root)
+        self.overlay.overrideredirect(True)
+        self.overlay.attributes("-topmost", True)
+        self.overlay.configure(bg="#ff00ff")
+        self.overlay.wm_attributes("-transparentcolor", "#ff00ff")
+        self.canvas = tk.Canvas(self.overlay, bg="#ff00ff", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.overlay.withdraw()
+        self.root.after(300, self._make_clickthrough)
+
+    def _make_clickthrough(self):
+        # Tk's winfo_id() is its client HWND; Windows window styles belong to
+        # the parent wrapper HWND. Apply the color key to that wrapper.
+        hwnd = user32.GetParent(self.overlay.winfo_id())
+        if not hwnd:
+            hwnd = self.overlay.winfo_id()
+        style = user32.GetWindowLongW(hwnd, -20)
+        user32.SetWindowLongW(hwnd, -20, style | 0x20 | 0x80000 | 0x08000000)
+        user32.SetLayeredWindowAttributes(hwnd, 0x00FF00FF, 0, 0x1)
+
+    def _initial_load(self):
+        if self.args.tool_solution:
+            try:
+                solution = json.loads(self.args.tool_solution.read_text(encoding="utf-8"))
+                if solution.get("status") != "solved" or not solution.get("verified"):
+                    raise ValueError("道具路线尚未验证")
+                actions = [tuple(item) if isinstance(item, list) else item
+                           for item in solution["actions"]]
+                self.load_tool_board(self.args.map_file, actions,
+                                     self.args.resume or 0)
+            except Exception as exc:
+                self.status.set(f"无法加载道具路线：{exc}")
+            return
+        if self.args.resume is None:
+            self.status.set("第一关自行完成。请先点“监听下一局”，进入第二关后会自动显示提示。")
+            self.target.set("等待第二关")
+            return
+        try:
+            solution = json.loads(self.args.solution.read_text(encoding="utf-8"))
+            if solution.get("status") != "solved" or not solution.get("verified"):
+                raise ValueError("已保存路线尚未完整验证")
+            self.load_board(self.args.map_file, solution["clicks"], self.args.resume)
+        except Exception as exc:
+            self.status.set(f"没有可用的当前关卡：{exc}。请点“监听下一局”。")
+
+    def load_board(self, path, ids, resume=0):
+        board = Board.from_json(path)
+        if any(tile.type <= 0 for tile in board.tiles):
+            raise ValueError("地图尚未还原图案")
+        state = board.initial()
+        if resume < 0 or resume > len(ids):
+            raise ValueError("续接步数超出路线长度")
+        for tile_id in ids[:resume]:
+            state = board.move(state, tile_id)
+        if state.lost:
+            raise ValueError("保存的续接状态已失败")
+        self.board = board
+        self.tool_engine = None
+        self.map_file = path
+        self.state = state
+        self.clicks = ids[:resume]
+        self.plan = ids[resume:]
+        self.pending = None
+        self.aux_centers = None
+        self.aux_rect = None
+        self.stage2_active = resume > 0
+        self.stage2_hits = 0
+        self.status.set("已连接。请在游戏中手动点击标记的牌。" if self.stage2_active
+                        else "第一关自行完成；检测到第二关后自动开始辅助。")
+        self.render()
+
+    def load_tool_board(self, path, actions, resume=0):
+        board = Board.from_json(path)
+        engine = ToolEngine(board)
+        if not 0 <= resume <= len(actions):
+            raise ValueError("续接步数超出路线长度")
+        state = engine.initial()
+        for action in actions[:resume]:
+            state = engine.apply(state, action)
+        # Check the complete route before showing the first recommendation.
+        verified = state
+        for action in actions[resume:]:
+            verified = engine.apply(verified, action)
+        if not engine.won(verified):
+            raise ValueError("道具路线无法完整通关")
+        self.board = board
+        self.tool_engine = engine
+        self.map_file = path
+        self.state = state
+        self.clicks = list(actions[:resume])
+        self.plan = list(actions[resume:])
+        self.pending = None
+        self.aux_centers = None
+        self.aux_rect = None
+        self.stage2_active = resume > 0
+        self.stage2_hits = 0
+        self.status.set("已载入含移出和复活的完整路线。" if self.stage2_active
+                        else "第一关自行完成；检测到第二关后自动开始辅助。")
+        self.render()
+
+    def render(self):
+        if self.board is None:
+            return
+        done = bin(self.state.removed).count("1")
+        self.progress.set(f"已点牌 {done} / {len(self.board.tiles)} · 剩余 {len(self.plan)} 个操作")
+        counts = (Counter(self.board.tiles[index].type for index in self.state.tray)
+                  if self.tool_engine else
+                  {kind: count for kind, count in enumerate(self.state.tray) if count})
+        tray_text = "、".join(f"{ICON_NAMES.get(kind, kind)}×{count}"
+                              for kind, count in sorted(counts.items())) or "空"
+        if self.tool_engine and any(self.state.aux):
+            aux_text = "；移出区：" + "、".join(
+                f"{i+1}列 {ICON_NAMES.get(self.board.tiles[stack[-1]].type, '')}"
+                for i, stack in enumerate(self.state.aux) if stack)
+        else:
+            aux_text = ""
+        self.tray.set("槽位：" + tray_text + aux_text)
+        if not self.stage2_active:
+            self.target.set("等待第二关")
+        elif ((self.tool_engine.won(self.state) if self.tool_engine
+               else self.board.won(self.state))):
+            self.target.set("已完成！")
+        elif self.plan:
+            action = self.plan[0]
+            if action == "MOVE_OUT":
+                self.target.set("使用“移出”道具")
+            elif action == "REVIVE":
+                self.target.set("点击“复活”")
+            elif isinstance(action, tuple):
+                slot = action[1]
+                index = self.state.aux[slot][-1]
+                kind = self.board.tiles[index].type
+                self.target.set(f"点移出区第 {slot+1} 列 · {ICON_NAMES.get(kind, kind)}")
+            else:
+                tile = self.board.tiles[self.board.index[action]]
+                self.target.set(f"{ICON_NAMES.get(tile.type, str(tile.type))}  ·  {tile.id}")
+        else:
+            self.target.set("等待重新规划")
+        visible = self.board.visible_indices(self.state)
+        self.manual_choices = {
+            f"{ICON_NAMES.get(self.board.tiles[index].type, self.board.tiles[index].type)} · {self.board.tiles[index].id}":
+            self.board.tiles[index].id for index in visible}
+        if self.tool_engine:
+            for slot, stack in enumerate(self.state.aux):
+                if stack:
+                    tile = self.board.tiles[stack[-1]]
+                    self.manual_choices[
+                        f"移出区{slot+1}列 · {ICON_NAMES.get(tile.type, tile.type)}"] = ("AUX", slot)
+        self.manual_picker["values"] = list(self.manual_choices)
+        if self.manual_choice.get() not in self.manual_choices:
+            self.manual_choice.set("")
+        self._draw_overlay()
+
+    def _draw_overlay(self):
+        rect = game_rect()
+        self.rect = rect
+        foreground = user32.GetForegroundWindow()
+        game_hwnd = user32.FindWindowW(None, TITLE)
+        panel_hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+        self.focus_active = foreground in (game_hwnd, panel_hwnd)
+        if (not rect or not self.overlay_enabled.get() or not self.plan or
+                self.board is None or not self.stage2_active or not self.focus_active):
+            self.overlay.withdraw()
+            return
+        left, top, width, height = rect
+        if width < 200 or height < 400:
+            self.overlay.withdraw()
+            return
+        self.overlay.geometry(f"{width}x{height}+{left}+{top}")
+        self.canvas.configure(width=width, height=height)
+        self.canvas.delete("all")
+        action = self.plan[0]
+        if action == "REVIVE":
+            self.overlay.withdraw()
+            return
+        if isinstance(action, tuple):
+            centers = self._aux_points(rect)
+            if not centers:
+                self.overlay.withdraw()
+                return
+            sx, sy = centers[action[1]]
+        elif action == "MOVE_OUT":
+            sx, sy = left + 116*width/573, top + 1000*height/1067
+        else:
+            tile = self.board.tiles[self.board.index[action]]
+            sx, sy = tile_center(tile, rect)
+        x, y = sx - left, sy - top
+        scale = width / 573
+        radius = 28 * scale
+        self.canvas.create_oval(x-radius, y-radius, x+radius, y+radius,
+                                outline="#ff1717", width=max(4, int(5*scale)))
+        self.canvas.create_oval(x-4, y-4, x+4, y+4, fill="#ff1717", outline="white")
+        self.overlay.deiconify()
+        self.overlay.lift()
+
+    def _aux_points(self, rect):
+        if not self.aux_centers or not self.aux_rect:
+            return None
+        old_left, old_top, old_width, old_height = self.aux_rect
+        left, top, width, height = rect
+        return [(left + (x-old_left)*width/old_width,
+                 top + (y-old_top)*height/old_height)
+                for x, y in self.aux_centers]
+
+    def _poll(self):
+        try:
+            self._poll_mouse()
+            if self.capture_proc is not None:
+                self._poll_capture()
+            if self.board is not None and not self.stage2_active:
+                self._poll_stage()
+            if self.board is not None:
+                rect = game_rect()
+                foreground = user32.GetForegroundWindow()
+                game_hwnd = user32.FindWindowW(None, TITLE)
+                panel_hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+                active = foreground in (game_hwnd, panel_hwnd)
+                if rect != self.rect or active != self.focus_active:
+                    self._draw_overlay()
+        except Exception as exc:
+            self.status.set(f"监控异常：{exc}")
+        finally:
+            self.root.after(20, self._poll)
+
+    def _poll_mouse(self):
+        # The low bit also reports a short click that started and ended between
+        # polls. The high bit reports a button still held down.
+        key_state = user32.GetAsyncKeyState(0x01)
+        down = bool(key_state & 0x8000)
+        pressed = bool(key_state & 0x0001)
+        if ((down or pressed) and not self.last_down and self.auto_track.get()
+                and self.board and self.stage2_active and not self.pending
+                and user32.GetForegroundWindow() == user32.FindWindowW(None, TITLE)):
+            rect = game_rect()
+            if rect:
+                x, y = cursor()
+                if rect[0] <= x < rect[0]+rect[2] and rect[1] <= y < rect[1]+rect[3]:
+                    self._candidate_click(x, y, rect)
+        self.last_down = down
+
+    def _poll_stage(self):
+        now = time.monotonic()
+        if now - self.last_stage_check < 0.5:
+            return
+        panel_hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+        if user32.GetForegroundWindow() not in (
+                user32.FindWindowW(None, TITLE), panel_hwnd):
+            return
+        self.last_stage_check = now
+        visible = current_stage_is_second(game_rect())
+        self.stage2_hits = self.stage2_hits + 1 if visible else 0
+        if self.stage2_hits >= 2:
+            self.stage2_active = True
+            self.status.set("检测到第二关，已开始显示通关提示。")
+            self.render()
+
+    def _candidate_click(self, x, y, rect):
+        if self.tool_engine and self.plan:
+            expected = self.plan[0]
+            if expected == "MOVE_OUT":
+                cx = rect[0] + 116*rect[2]/573
+                cy = rect[1] + 1000*rect[3]/1067
+                if abs(x-cx) > 60*rect[2]/573 or abs(y-cy) > 48*rect[3]/1067:
+                    return
+                try:
+                    before = crop_at(cx, cy)
+                    area_before = ImageGrab.grab(bbox=aux_area(rect)).convert("RGB")
+                except Exception:
+                    before = area_before = None
+                self.pending = ("MOVE_OUT", cx, cy, rect, before, None, area_before)
+                self.root.after(900, self._verify_click)
+                return
+            if expected == "REVIVE":
+                return
+            if isinstance(expected, tuple):
+                area = aux_area(rect)
+                if not (area[0] <= x < area[2] and area[1] <= y < area[3]):
+                    return
+                action = expected
+                centers = self._aux_points(rect)
+                if centers:
+                    slot = min(range(3), key=lambda i: (
+                        (x-centers[i][0])**2 +
+                        (y-centers[i][1])**2))
+                    cx, cy = centers[slot]
+                    if (abs(x-cx) > 34*rect[2]/573 or
+                            abs(y-cy) > 38*rect[3]/1067 or
+                            not self.state.aux[slot]):
+                        return
+                    action = ("AUX", slot)
+                else:
+                    cx, cy = x, y
+                try:
+                    before = crop_at(cx, cy)
+                    scale = rect[2]/573
+                    tray_before = ImageGrab.grab(bbox=(
+                        int(rect[0]+40*scale), int(rect[1]+835*rect[3]/1067),
+                        int(rect[0]+530*scale), int(rect[1]+920*rect[3]/1067))).convert("RGB")
+                except Exception:
+                    before = tray_before = None
+                self.pending = (action, cx, cy, rect, before, tray_before)
+                self.root.after(650, self._verify_click)
+                return
+        visible = self.board.visible_indices(self.state)
+        scale = rect[2] / 573
+        candidates = []
+        for index in visible:
+            tile = self.board.tiles[index]
+            cx, cy = tile_center(tile, rect)
+            if abs(cx-x) <= 27*scale and abs(cy-y) <= 27*scale:
+                candidates.append((tile.layer, -(cx-x)**2-(cy-y)**2, index))
+        if not candidates:
+            return
+        index = max(candidates)[2]
+        tile = self.board.tiles[index]
+        cx, cy = tile_center(tile, rect)
+        try:
+            before = crop_at(cx, cy)
+            tray_before = ImageGrab.grab(bbox=(
+                int(rect[0]+40*scale), int(rect[1]+835*rect[3]/1067),
+                int(rect[0]+530*scale), int(rect[1]+920*rect[3]/1067))).convert("RGB")
+        except Exception:
+            before = tray_before = None
+        self.pending = (tile.id, cx, cy, rect, before, tray_before)
+        self.root.after(650, self._verify_click)
+
+    def _verify_click(self):
+        if self.pending is None:
+            return
+        tile_id, cx, cy, rect, before, tray_before, *extra = self.pending
+        if game_rect() != rect:
+            self.pending = None
+            self.status.set("游戏窗口位置发生变化，请重试这张牌。")
+            return
+        try:
+            after = crop_at(cx, cy)
+            scale = rect[2]/573
+            tray_after = ImageGrab.grab(bbox=(
+                int(rect[0]+40*scale), int(rect[1]+835*rect[3]/1067),
+                int(rect[0]+530*scale), int(rect[1]+920*rect[3]/1067))).convert("RGB")
+            score = max(change_score(before, after),
+                        change_score(tray_before, tray_after))
+            if tile_id == "MOVE_OUT" and extra and extra[0] is not None:
+                area_after = ImageGrab.grab(bbox=aux_area(rect)).convert("RGB")
+                score = max(score, change_score(extra[0], area_after))
+                centers = find_aux_centers(extra[0], area_after, rect)
+                if centers:
+                    self.aux_centers = centers
+                    self.aux_rect = rect
+        except Exception:
+            score = 0
+        threshold = 5 if isinstance(tile_id, tuple) else 3
+        if score >= threshold:
+            self._accept(tile_id)
+        else:
+            self.status.set("没检测到画面变化。若操作已完成，点“确认这步已完成”；否则重试。")
+
+    def confirm_pending(self):
+        if self.pending:
+            self._accept(self.pending[0])
+        elif self.board and self.plan:
+            # A click can be missed by mouse polling or the game can animate
+            # before the screenshot check. Let the player explicitly confirm
+            # the card currently highlighted on the board.
+            self._accept(self.plan[0])
+        elif self.board:
+            self.status.set("当前没有待确认的路线，请先重新规划。")
+
+    def clear_pending(self):
+        self.pending = None
+        self.status.set("已清除待确认点击，可以在游戏里重试。")
+
+    def manual_sync(self):
+        tile_id = self.manual_choices.get(self.manual_choice.get())
+        if tile_id:
+            self._accept(tile_id)
+        else:
+            self.status.set("请先从下拉框选择刚才消除的牌。")
+
+    def _accept(self, tile_id):
+        self.pending = None
+        try:
+            next_state = (self.tool_engine.apply(self.state, tile_id) if self.tool_engine
+                          else self.board.move(self.state, tile_id))
+        except IllegalMove as exc:
+            self.status.set(f"无法同步这次点击：{exc}")
+            return
+        if next_state.lost:
+            self.status.set("模型显示这步会填满 7 格，请核对游戏状态。")
+            return
+        self.state = next_state
+        self.clicks.append(tile_id)
+        if self.plan and tile_id == self.plan[0]:
+            self.plan.pop(0)
+            if self.plan and self.plan[0] == "REVIVE":
+                self.status.set("完成屏幕提示的操作后，按“确认这步已完成”。")
+            else:
+                self.status.set("已识别操作，下一步已标出。")
+        else:
+            self.plan = []
+            self.status.set("点击偏离路线，正在从当前局面重新规划…")
+            self.replan()
+        self.render()
+
+    def undo(self):
+        self.pending = None
+        if not self.clicks or not self.board:
+            return
+        self.clicks.pop()
+        state = self.tool_engine.initial() if self.tool_engine else self.board.initial()
+        for tile_id in self.clicks:
+            state = (self.tool_engine.apply(state, tile_id) if self.tool_engine
+                     else self.board.move(state, tile_id))
+        self.state = state
+        self.plan = []
+        self.status.set("已撤销最后一次识别，正在重新规划…")
+        self.replan()
+        self.render()
+
+    def replan(self):
+        if not self.board or self.solving:
+            return
+        self.solving = True
+        board, state = self.board, self.state
+        engine = self.tool_engine
+        self.search_attempt += 1
+        attempt = self.search_attempt
+        self.status.set("正在计算当前局面的路线…")
+
+        def work():
+            try:
+                if engine:
+                    result = search_with_tools(board, seconds=100,
+                                               max_states=4_000_000,
+                                               max_branches=8, seed=attempt,
+                                               initial_state=engine.search_start(state))
+                    ids = [board.tiles[item].id if isinstance(item, int) else item
+                           for item in result["path"]]
+                    check = state
+                    if result["status"] == "solved":
+                        for action in ids:
+                            check = engine.apply(check, action)
+                    verified = engine.won(check)
+                else:
+                    result = depth_search(board, seconds=90, seed=attempt,
+                                          initial_state=state, max_branches=6,
+                                          max_states=5_000_000)
+                    ids = [board.tiles[index].id for index in result["path"]]
+                    verified = (result["status"] == "solved" and
+                                replay(board, result["path"], state))
+                if result["status"] != "solved" or not verified:
+                    raise ValueError("本轮搜索预算耗尽；不能据此判定关卡无解")
+                self.root.after(0, lambda: self._finish_replan(board, state, ids, None))
+            except Exception as exc:
+                self.root.after(0, lambda error=str(exc): self._finish_replan(board, state, None, error))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_replan(self, board, state, ids, error):
+        self.solving = False
+        if self.board is not board or self.state != state:
+            self.replan()
+            return
+        if error:
+            self.status.set(f"重新规划失败：{error}。可尝试撤销识别。")
+        else:
+            self.plan = ids
+            self.status.set("路线已重新计算并验证。")
+            if self.tool_engine:
+                (CAPTURES / "solution_current.json").write_text(
+                    json.dumps({"status": "solved", "verified": True,
+                                "actions": self.clicks + ids}, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+        self.render()
+
+    def start_capture(self):
+        if self.capture_proc is not None:
+            self.status.set("已经在监听下一局。")
+            return
+        if not (ROOT / "start_capture.ps1").exists():
+            self.status.set("找不到抓取脚本。")
+            return
+        seed_path = CAPTURES / "recovered_seed.json"
+        self.capture_stamp = seed_path.stat().st_mtime_ns if seed_path.exists() else 0
+        self.status.set("正在准备抓取。启动后请在微信小程序中重新进入关卡。")
+
+        def work():
+            try:
+                subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                "-File", str(ROOT / "install_capture_cert.ps1")],
+                               check=True, capture_output=True, text=True, timeout=45)
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                proc = subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy",
+                                         "Bypass", "-File", str(ROOT / "start_capture.ps1"),
+                                         "-SeedProbe", "-DurationSeconds", "600"],
+                                        cwd=ROOT, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, creationflags=flags)
+                self.root.after(0, lambda: self._capture_started(proc))
+            except Exception as exc:
+                self.root.after(0, lambda error=str(exc): self.status.set(
+                    f"抓取启动失败：{error}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _capture_started(self, proc):
+        self.capture_proc = proc
+        self.status.set("正在监听新开局。现在打开小程序并进入关卡；识别到地图后会自动求解。")
+
+    def _poll_capture(self):
+        seed_path = CAPTURES / "recovered_seed.json"
+        if seed_path.exists() and seed_path.stat().st_mtime_ns > self.capture_stamp:
+            self.capture_stamp = seed_path.stat().st_mtime_ns
+            self.stop_capture()
+            self.status.set("已获取本局种子，正在还原图案并求解…")
+            threading.Thread(target=self._prepare_new_board, daemon=True).start()
+        elif self.capture_proc.poll() is not None:
+            self.capture_proc = None
+            self.status.set("抓取已结束。如果尚未拿到种子，请检查代理和证书。")
+
+    def stop_capture(self):
+        proc = self.capture_proc
+        self.capture_proc = None
+        if proc is None:
+            return
+        pid_file = CAPTURES / "mitmdump.pid"
+
+        def work():
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    subprocess.run(["powershell", "-NoProfile", "-Command",
+                                    f"Stop-Process -Id {pid} -ErrorAction SilentlyContinue"],
+                                   capture_output=True, timeout=15)
+                except (ValueError, OSError, subprocess.TimeoutExpired):
+                    pass
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+            subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                            "-File", str(ROOT / "remove_capture_cert.ps1")],
+                           capture_output=True, timeout=15)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _prepare_new_board(self):
+        try:
+            seed = json.loads((CAPTURES / "recovered_seed.json").read_text(encoding="utf-8"))
+            hashes = set(seed["map_md5"])
+            templates = list((ROOT / "templates").glob("map_*.json"))
+            templates.extend(CAPTURES.glob("map_*.json"))
+            compatible = []
+            for path in templates:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("sourceMapMd5") in hashes:
+                    compatible.append((sum(len(layer) for layer in data["levelData"].values()), path))
+            if not compatible:
+                raise ValueError("本局地图模板与本机保存的模板不同，需重新抓取 .map 文件")
+            _, template = max(compatible)
+            typed = CAPTURES / "typed_current.json"
+            subprocess.run(["node", str(ROOT / "tools" / "restore_types.js"),
+                            str(template), str(CAPTURES / "recovered_seed.json"), str(typed)],
+                           check=True, capture_output=True, text=True, timeout=30)
+            board = Board.from_json(typed)
+            engine = ToolEngine(board)
+            for attempt, seed in enumerate((0, 2, 1, 3, 4), 1):
+                self.root.after(0, lambda n=attempt: self.status.set(
+                    f"正在搜索第 {n}/5 组路线（必要时使用移出和复活）…"))
+                normal = depth_search(board, seconds=30, seed=seed,
+                                      max_branches=6, max_states=1_500_000)
+                if normal["status"] == "solved":
+                    actions = [board.tiles[index].id for index in normal["path"]]
+                else:
+                    planned = search_with_tools(board, seconds=40,
+                                                max_states=2_000_000,
+                                                max_branches=8, seed=seed,
+                                                prefix=normal["path"])
+                    if planned["status"] != "solved":
+                        continue
+                    actions = [board.tiles[item].id if isinstance(item, int) else item
+                               for item in planned["path"]]
+                check = engine.initial()
+                for action in actions:
+                    check = engine.apply(check, action)
+                if not engine.won(check):
+                    continue
+                (CAPTURES / "solution_current.json").write_text(json.dumps({
+                    "status": "solved", "verified": True, "actions": actions,
+                    "map_file": str(typed)}, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.root.after(0, lambda route=actions: self.load_tool_board(typed, route))
+                return
+            self.root.after(0, lambda: self._load_unsolved(typed))
+        except Exception as exc:
+            self.root.after(0, lambda error=str(exc): self.status.set(f"新关卡准备失败：{error}"))
+
+    def _load_unsolved(self, path):
+        self.board = Board.from_json(path)
+        self.tool_engine = ToolEngine(self.board)
+        self.map_file = path
+        self.state = self.tool_engine.initial()
+        self.clicks = []
+        self.plan = []
+        self.pending = None
+        self.aux_centers = None
+        self.aux_rect = None
+        self.stage2_active = False
+        self.stage2_hits = 0
+        self.status.set("当前搜索预算内仍未找到路线，不能判定无解。可点“重新规划”继续尝试。")
+        self.render()
+
+    def _close(self):
+        self.stop_capture()
+        self.root.destroy()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sheep Planet manual-play desktop assistant")
+    parser.add_argument("--map", dest="map_file", type=Path,
+                        default=CAPTURES / "typed_map_2.json")
+    parser.add_argument("--solution", type=Path, default=CAPTURES / "solution.json")
+    parser.add_argument("--tool-solution", type=Path,
+                        help="verified route including Move Out and revive actions")
+    parser.add_argument("--resume", type=int, default=None,
+                        help="number of already clicked cards in the saved solution")
+    args = parser.parse_args()
+    root = tk.Tk()
+    Assistant(root, args)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

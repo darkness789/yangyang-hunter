@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>羊了个羊：星球 · 通关辅助</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+    body { margin: 0; background: #f6f3eb; color: #262526; }
+    main { max-width: 1050px; margin: auto; padding: 24px; }
+    h1 { font-size: 23px; margin: 0 0 8px; }
+    p { line-height: 1.6; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 24px; align-items: start; }
+    .board { position: relative; min-height: 680px; border-radius: 16px; background: #e4decf; border: 1px solid #c8beae; overflow: hidden; }
+    .tile { position: absolute; width: 43px; height: 48px; box-sizing: border-box; display: flex; align-items: center; justify-content: center; border: 2px solid #6e6259; border-radius: 8px; background: #fffdf4; color: #3a2d26; font-weight: 700; font-size: 17px; box-shadow: 1px 3px 3px #0002; cursor: pointer; user-select: none; }
+    .tile.covered { background: #aa9d8d; color: #5a514a; cursor: default; }
+    .tile.next { background: #ffe69b; border: 3px solid #db7814; box-shadow: 0 0 0 5px #ffac3980; }
+    aside { background: #fff; border-radius: 14px; padding: 20px; box-shadow: 0 2px 12px #0001; }
+    button { border: 0; border-radius: 8px; padding: 10px 14px; font: inherit; cursor: pointer; background: #386c62; color: #fff; margin: 5px 4px 5px 0; }
+    button.secondary { background: #786d65; }
+    button:disabled { opacity: .4; cursor: default; }
+    .recommend { font-size: 20px; font-weight: 700; color: #9c510f; }
+    .muted { color: #706e69; font-size: 14px; }
+    #error { color: #a71e1e; min-height: 1.5em; }
+    @media (max-width: 750px) { .layout { grid-template-columns: 1fr; } .board { min-height: 650px; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>羊了个羊：星球 · 通关辅助</h1>
+  <p class="muted">按图中的编号在游戏中找到同一张牌。先在游戏里点击，再点击这里的对应牌确认。金色牌是推荐的下一步。</p>
+  <div class="layout">
+    <div class="board" id="board" aria-label="关卡地图"></div>
+    <aside>
+      <div>已确认 <strong id="progress">0</strong> 张</div>
+      <p>下一张：<span class="recommend" id="next">尚未计算</span></p>
+      <p>槽位：<span id="tray">空</span></p>
+      <p>路线：<span id="route">尚未计算</span></p>
+      <button id="solve">计算路线</button>
+      <button id="confirm" class="secondary">确认推荐牌</button>
+      <button id="undo" class="secondary">撤销记录</button>
+      <p id="error"></p>
+      <p class="muted">如果实际点击的牌不同，点图中对应的可点击牌，再重新计算路线。图中牌以数字表示图案类别，灰色表示目前受遮挡。</p>
+    </aside>
+  </div>
+</main>
+<script>
+  let state;
+  const board = document.getElementById('board');
+  const error = document.getElementById('error');
+  async function request(path, data) {
+    error.textContent = '';
+    const options = data === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data)};
+    const response = await fetch(path, options);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || '请求失败');
+    state = payload;
+    render();
+  }
+  function render() {
+    board.replaceChildren();
+    const live = state.tiles.filter(tile => !tile.removed);
+    const minX = Math.min(...state.tiles.map(tile => tile.x));
+    const minY = Math.min(...state.tiles.map(tile => tile.y));
+    const maxX = Math.max(...state.tiles.map(tile => tile.x));
+    const maxY = Math.max(...state.tiles.map(tile => tile.y));
+    const scale = Math.min((board.clientWidth - 58) / (maxX - minX + 8), (board.clientHeight - 58) / (maxY - minY + 8));
+    live.sort((a, b) => a.layer - b.layer).forEach(tile => {
+      const element = document.createElement('div');
+      element.className = 'tile' + (tile.visible ? '' : ' covered') + (state.next === tile.id ? ' next' : '');
+      element.style.left = `${22 + (tile.x - minX) * scale}px`;
+      element.style.top = `${22 + (tile.y - minY) * scale}px`;
+      element.style.width = `${Math.max(30, 8 * scale)}px`;
+      element.style.height = `${Math.max(30, 8 * scale)}px`;
+      element.style.zIndex = tile.layer;
+      element.textContent = tile.type;
+      element.title = `${tile.id} · 图案 ${tile.type} · 第 ${tile.layer} 层`;
+      if (tile.visible) element.onclick = () => act('/api/move', {id: tile.id});
+      board.append(element);
+    });
+    document.getElementById('progress').textContent = `${state.clicked.length}/${state.tiles.length}`;
+    document.getElementById('next').textContent = state.won ? '已通关' : (state.next || '无');
+    document.getElementById('tray').textContent = Object.keys(state.tray).length ? Object.entries(state.tray).map(([kind, count]) => `${kind}×${count}`).join('、') : '空';
+    document.getElementById('route').textContent = state.search.status === 'solved' ? `剩余 ${state.plan_length} 步` : ({not_started: '尚未计算', not_found: `未找到（已搜到 ${state.search.depth} 步）`, needs_replan: '请重新计算'}[state.search.status] || state.search.status);
+    document.getElementById('confirm').disabled = !state.next;
+    document.getElementById('undo').disabled = !state.clicked.length;
+  }
+  async function act(path, data) { try { await request(path, data); } catch (cause) { error.textContent = cause.message; } }
+  document.getElementById('solve').onclick = async () => { error.textContent = '正在搜索，请稍候…'; await act('/api/solve', {}); };
+  document.getElementById('confirm').onclick = () => state.next && act('/api/move', {id: state.next});
+  document.getElementById('undo').onclick = () => act('/api/undo', {});
+  addEventListener('resize', () => state && render());
+  act('/api/state');
+</script>
+</body>
+</html>
