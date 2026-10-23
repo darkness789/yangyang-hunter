@@ -20,6 +20,8 @@
 
 Windows 上直接双击项目根目录的 `羊羊狩猎者.exe`。它使用同目录下的 `scripts/`、`yangyang_hunter/templates/`，并将本机抓取数据保存在 `captures/`。请保留这些目录；exe 已包含运行界面所需的 Python 环境，但监听新局仍需要上面列出的 Node.js 和 mitmproxy。
 
+首次监听需要确认安装 mitmproxy 的当前用户根证书。程序在后续监听之间保留已确认的同一张证书，不再重复弹出安装确认；证书变更时仍需重新确认。如需撤销信任，运行 `powershell -ExecutionPolicy Bypass -File scripts/remove_capture_cert.ps1`。
+
 也可以在项目目录从 Python 源码运行：
 
 ```powershell

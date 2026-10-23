@@ -1255,9 +1255,9 @@ class Assistant:
                 proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 proc.terminate()
-            subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                            "-File", str(SCRIPTS / "remove_capture_cert.ps1")],
-                           capture_output=True, timeout=15)
+            # Keep the previously approved CA in CurrentUser\Root between
+            # captures. The install script checks its thumbprint on startup;
+            # repeatedly removing it would prompt Windows on every new game.
 
         thread = threading.Thread(target=work, daemon=True)
         self.capture_stop_thread = thread
