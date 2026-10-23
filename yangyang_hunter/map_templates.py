@@ -37,7 +37,12 @@ def _validate_template(data, map_id):
     if not isinstance(layers, dict) or not isinstance(groups, dict):
         raise ValueError("地图结构不完整")
     cards = [card for layer in layers.values() for card in layer]
-    if not cards or len(cards) != 3 * sum(groups.values()):
+    # blockTypeData counts only cards whose types are assigned from the seed.
+    # Daily maps may also contain cards with a fixed, preset type.
+    untyped = [card for card in cards if card.get("type") == 0]
+    if (not cards or len(untyped) != 3 * sum(groups.values()) or
+            len(cards) % 3 or any(not isinstance(card.get("type"), int) or
+                                  card["type"] < 0 for card in cards)):
         raise ValueError("地图牌数与图案数量不匹配")
     ids = [card.get("id") for card in cards]
     if any(not isinstance(card_id, str) or not card_id for card_id in ids):
