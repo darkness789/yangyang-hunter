@@ -44,7 +44,7 @@ class SpecialPlannerTests(unittest.TestCase):
         self.assertEqual(plan_next_crush(board, ToolEngine(board).initial(),
                                          seconds=.1), [])
 
-    def test_revive_is_reserved_until_tray_is_full(self):
+    def test_revive_requires_a_verified_followup_triple(self):
         board = Board([Tile(str(i), i + 1, i * 16, 0, 1, 1)
                        for i in range(8)])
         state = ToolState((1 << 6) - 1, tuple(range(6)),
@@ -53,6 +53,22 @@ class SpecialPlannerTests(unittest.TestCase):
         full = ToolState((1 << 7) - 1, tuple(range(7)),
                          ((), (), ()), used_remove=True)
         self.assertEqual(plan_next_crush(board, full, seconds=.1), ["REVIVE"])
+
+    def test_plans_into_revive_when_it_unlocks_a_triple(self):
+        tiles = [Tile(str(i), i + 1, i * 16, 0, 1, 1)
+                 for i in range(6)]
+        tiles += [Tile(f"match-{i}", 7, 100 + i * 16, 0, 1, 1)
+                  for i in range(3)]
+        board = Board(tiles)
+        state = ToolState((1 << 6) - 1, tuple(range(6)),
+                          ((), (), ()), used_remove=True)
+        path = plan_next_crush(board, state, seconds=.5)
+        self.assertIn("REVIVE", path)
+        self.assertNotIn("MOVE_OUT", path)
+        for action in path:
+            state = ToolEngine(board).apply(state, action)
+        self.assertTrue(state.used_revive)
+        self.assertEqual(len(state.tray), 3)
 
     def test_move_out_must_enable_a_triple_without_revive(self):
         tiles = [Tile(str(i), i + 1, i * 16, 0, 1, 1)

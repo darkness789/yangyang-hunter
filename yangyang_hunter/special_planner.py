@@ -207,21 +207,36 @@ def plan_next_crush(board, state, seconds=5, seed=0, cancel_event=None,
         return segment
 
     # Move Out is only useful if its freed slots lead to a verified triple.
-    # Reserve Revive for a tray that has actually reached seven cards.
-    if state.used_remove or len(state.tray) < 4:
-        return []
-    moved = engine.apply(state, "MOVE_OUT")
-    segment = _local_triple(board, moved, time.monotonic() + seconds * .2,
-                            cancel_event, special_cards)
-    if cancel_event is not None and cancel_event.is_set():
-        return []
-    if not segment:
+    if not state.used_remove and len(state.tray) >= 4:
+        moved = engine.apply(state, "MOVE_OUT")
+        segment = _local_triple(board, moved, time.monotonic() + seconds * .2,
+                                cancel_event, special_cards)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        if not segment:
+            result = search_with_tools(
+                board, seconds=seconds * .1, max_states=100_000,
+                max_branches=14, initial_state=engine.search_start(moved),
+                allow_remove=False, allow_revive=False,
+                allow_unmatched_aux=True, seed=seed, cancel_event=cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                return []
+            segment = _segment(board, moved, result["path"])
+        if segment:
+            return ["MOVE_OUT"] + segment
+
+    # If ordinary play and Move Out cannot reach a triple, filling the tray
+    # can be worthwhile when Revive then produces a real triple. Never spend
+    # it merely because a static search path reached seven cards.
+    if not state.used_revive:
         result = search_with_tools(
-            board, seconds=seconds * .1, max_states=100_000,
-            max_branches=14, initial_state=engine.search_start(moved),
-            allow_remove=False, allow_revive=False,
+            board, seconds=max(.5, seconds * .2), max_states=250_000,
+            max_branches=24, initial_state=engine.search_start(state),
+            allow_remove=False, allow_revive=True,
             allow_unmatched_aux=True, seed=seed, cancel_event=cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             return []
-        segment = _segment(board, moved, result["path"])
-    return ["MOVE_OUT"] + segment if segment else []
+        segment = _segment(board, state, result["path"])
+        if segment:
+            return segment
+    return []
