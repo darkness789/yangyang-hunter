@@ -1,5 +1,7 @@
 import unittest
 from unittest.mock import patch
+from dataclasses import replace
+from PIL import Image
 
 from yangyang_hunter.board_model import Board, Tile
 from yangyang_hunter.solve_with_tools import ToolEngine
@@ -46,9 +48,21 @@ class FakeUser32:
 
 
 class AutoClickTests(unittest.TestCase):
+    @staticmethod
+    def tray_image(count):
+        image = Image.new("RGB", (490, 85), (99, 167, 31))
+        for slot in range(count):
+            center = 25 + 72 * slot
+            for x in range(center - 12, center + 13):
+                for y in range(56, 70):
+                    image.putpixel((x, y), (246, 255, 205))
+        return image
+
     def assistant(self, action="0"):
         assistant = ui.Assistant.__new__(ui.Assistant)
         assistant.board = Board([Tile("0", 1, 0, 0, 1, 1)])
+        assistant.tool_engine = ToolEngine(assistant.board)
+        assistant.state = assistant.tool_engine.initial()
         assistant.plan = [action]
         assistant.auto_click = Value(True)
         assistant.status = Value("")
@@ -59,8 +73,17 @@ class AutoClickTests(unittest.TestCase):
         assistant.auto_next_at = 0
         assistant.auto_pending = False
         assistant._candidate_click = lambda x, y, rect: setattr(
-            assistant, "pending", (action, x, y, rect, None, None))
+            assistant, "pending", (action, x, y, rect, None, self.tray_image(0)))
         return assistant
+
+    def test_tray_reader_counts_cards_and_rejects_gaps(self):
+        for count in (0, 1, 4, 7):
+            with self.subTest(count=count):
+                self.assertEqual(ui.tray_count(self.tray_image(count)), count)
+        gap = self.tray_image(0)
+        for x in range(92, 113):
+            gap.putpixel((x, 62), (246, 255, 205))
+        self.assertIsNone(ui.tray_count(gap))
 
     def test_clicks_a_normal_card_once_and_waits_for_confirmation(self):
         assistant = self.assistant()
@@ -73,6 +96,46 @@ class AutoClickTests(unittest.TestCase):
         self.assertTrue(assistant.auto_pending)
         self.assertEqual([event for event in fake.events if event[0] == "button"],
                          [("button", 0x0002), ("button", 0x0004)])
+
+    def test_auto_clicks_an_aux_card_without_animation_detection(self):
+        assistant = self.assistant(("AUX", 0))
+        assistant.board = Board([Tile(str(i), 1, i * 8, 0, 1, 1)
+                                 for i in range(3)])
+        assistant.tool_engine = ToolEngine(assistant.board)
+        assistant.state = assistant.tool_engine.apply(
+            assistant.tool_engine.apply(assistant.tool_engine.initial(), "0"),
+            "MOVE_OUT")
+        assistant.aux_centers = None
+        assistant.aux_rect = None
+        fake = FakeUser32()
+        with patch.object(ui, "user32", fake), \
+                patch.object(ui, "game_rect", return_value=(0, 0, 573, 1067)), \
+                patch.object(ui, "cursor", return_value=(5, 6)):
+            assistant._poll_auto()
+        self.assertTrue(assistant.auto_pending)
+        self.assertIn(("move", 227, 777), fake.events)
+
+    def test_auto_stops_before_clicking_if_tray_is_out_of_sync(self):
+        assistant = self.assistant(("AUX", 1))
+        assistant.board = Board([Tile(str(i), 1, i * 8, 0, 1, 1)
+                                 for i in range(3)])
+        assistant.tool_engine = ToolEngine(assistant.board)
+        state = assistant.tool_engine.initial()
+        for action in ("0", "1", "MOVE_OUT", ("AUX", 0)):
+            state = assistant.tool_engine.apply(state, action)
+        assistant.state = state
+        # The pending screenshot says zero cards while the model says one.
+        assistant._candidate_click = lambda x, y, rect: setattr(
+            assistant, "pending", (("AUX", 1), x, y, rect, None,
+                                  self.tray_image(0)))
+        assistant.aux_centers = None
+        assistant.aux_rect = None
+        fake = FakeUser32()
+        with patch.object(ui, "user32", fake), \
+                patch.object(ui, "game_rect", return_value=(0, 0, 573, 1067)):
+            assistant._poll_auto()
+        self.assertFalse(assistant.auto_click.get())
+        self.assertFalse(any(event[0] == "button" for event in fake.events))
 
     def test_tool_action_waits_for_player(self):
         for action in ("MOVE_OUT", "REVIVE"):
@@ -153,6 +216,36 @@ class AutoClickTests(unittest.TestCase):
             assistant._verify_click()
         self.assertFalse(assistant.auto_click.get())
         self.assertIn("已暂停", assistant.status.get())
+
+    def test_tray_animation_alone_does_not_confirm_auto_click(self):
+        assistant = self.assistant()
+        assistant.auto_pending = True
+        assistant.verify_retry = 2
+        before = Image.new("RGB", (40, 40), (246, 255, 205))
+        assistant.pending = ("0", 100, 100, (0, 0, 573, 1067), before,
+                             self.tray_image(0))
+        assistant.clicks = []
+        with patch.object(ui, "game_rect", return_value=(0, 0, 573, 1067)), \
+                patch.object(ui, "crop_at", return_value=before), \
+                patch.object(ui.ImageGrab, "grab", return_value=self.tray_image(1)):
+            assistant._verify_click()
+        self.assertFalse(assistant.auto_click.get())
+        self.assertEqual(assistant.state.removed, 0)
+
+    def test_auto_never_takes_a_seventh_card_after_revive(self):
+        assistant = self.assistant("6")
+        assistant.board = Board([Tile(str(i), i + 1, i * 8, 0, 1, 1)
+                                 for i in range(7)])
+        assistant.tool_engine = ToolEngine(assistant.board)
+        state = replace(assistant.tool_engine.initial(), used_revive=True)
+        for i in range(6):
+            state = assistant.tool_engine.apply(state, str(i))
+        assistant.state = state
+        fake = FakeUser32()
+        with patch.object(ui, "user32", fake):
+            assistant._poll_auto()
+        self.assertFalse(assistant.auto_click.get())
+        self.assertFalse(any(event[0] == "button" for event in fake.events))
 
     def test_stage_detection_keeps_failed_search_hint(self):
         assistant = self.assistant()

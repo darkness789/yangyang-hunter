@@ -36,6 +36,7 @@ else:
     ROOT = PACKAGE_ROOT.parent
 CAPTURES = ROOT / "captures"
 SEARCH_CHECKPOINT = CAPTURES / "search_checkpoint.json"
+AUTO_TRACE = CAPTURES / "auto_click_trace.jsonl"
 SCRIPTS = ROOT / "scripts"
 SEARCH_TIMEOUT_SECONDS = 30
 SEARCH_BUDGET_SECONDS = 120
@@ -108,6 +109,28 @@ def change_score(before, after):
     if before is None or after is None:
         return 0.0
     return sum(ImageStat.Stat(ImageChops.difference(before, after)).mean) / 3
+
+
+def tray_count(image):
+    """Read the seven slot bottoms; return None during an unclear animation."""
+    if image is None or not hasattr(image, "size") or image.size[0] < 200:
+        return None
+    width, height = image.size
+    if height < 30:
+        return None
+    occupied = []
+    y = round(62 * height / 85)
+    for slot in range(7):
+        center = round((25 + 72 * slot) * width / 490)
+        green = 0
+        for offset in (-5, 0, 5):
+            x = max(0, min(width - 1, center + round(offset * width / 490)))
+            red, g, blue = image.getpixel((x, y))[:3]
+            green += g > 1.3 * red and g > 1.6 * blue
+        occupied.append(green < 2)
+    if any(occupied[i] and not occupied[i - 1] for i in range(1, 7)):
+        return None
+    return sum(occupied)
 
 
 def aux_area(rect):
@@ -213,6 +236,7 @@ class Assistant:
         self.special_mode = tk.BooleanVar(value=False)
         self.auto_next_at = 0.0
         self.auto_pending = False
+        self.trace_enabled = True
         self._build_ui()
         self.root.after(150, self._initial_load)
         self.root.after(60, self._poll)
@@ -245,7 +269,7 @@ class Assistant:
         ttk.Button(row2, text="停止监听", command=self.stop_capture).pack(side="left", padx=5)
         ttk.Checkbutton(row2, text="显示标记", variable=self.overlay_enabled).pack(side="left")
         ttk.Checkbutton(main, text="自动识别我在游戏中的点击", variable=self.auto_track).pack(anchor="w")
-        ttk.Checkbutton(main, text="自动点击普通牌（道具手动）", variable=self.auto_click,
+        ttk.Checkbutton(main, text="自动点击棋盘和移出区牌（道具手动）", variable=self.auto_click,
                         command=self._auto_mode_changed).pack(anchor="w")
         ttk.Checkbutton(main, text="特殊关卡：三消后重新计算变色牌",
                         variable=self.special_mode,
@@ -488,13 +512,30 @@ class Assistant:
         self.overlay.lift()
 
     def _aux_points(self, rect):
-        if not self.aux_centers or not self.aux_rect:
-            return None
-        old_left, old_top, old_width, old_height = self.aux_rect
         left, top, width, height = rect
-        return [(left + (x-old_left)*width/old_width,
-                 top + (y-old_top)*height/old_height)
-                for x, y in self.aux_centers]
+        if self.aux_centers and self.aux_rect:
+            old_left, old_top, old_width, old_height = self.aux_rect
+            points = [(left + (x-old_left)*width/old_width,
+                       top + (y-old_top)*height/old_height)
+                      for x, y in self.aux_centers]
+        else:
+            # The client uses three fixed columns. This also covers a failed
+            # tool-animation diff and a revive with no previous Move Out.
+            points = [(left + (227 + 56*slot)*width/573,
+                       top + 777*height/1067) for slot in range(3)]
+        return [(x, y - max(0, len(self.state.aux[slot]) - 1)*4.5*height/1067)
+                for slot, (x, y) in enumerate(points)]
+
+    def _trace(self, event, **details):
+        if not getattr(self, "trace_enabled", False):
+            return
+        try:
+            CAPTURES.mkdir(parents=True, exist_ok=True)
+            with AUTO_TRACE.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"time": time.time(), "event": event,
+                                         **details}, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     def _pause_auto_for_tool(self, action):
         self.auto_click.set(False)
@@ -542,6 +583,17 @@ class Assistant:
         if action in ("MOVE_OUT", "REVIVE"):
             self._pause_auto_for_tool(action)
             return
+        try:
+            expected_state = (self.tool_engine.apply(self.state, action)
+                              if self.tool_engine else self.board.move(self.state, action))
+        except IllegalMove as exc:
+            self.auto_click.set(False)
+            self.status.set(f"自动点击已暂停：路线当前不可执行：{exc}")
+            return
+        if expected_state.lost:
+            self.auto_click.set(False)
+            self.status.set("自动点击已暂停：这步会填满槽位且复活已用过。")
+            return
         rect = game_rect()
         hwnd = user32.FindWindowW(None, TITLE)
         if not rect or user32.GetForegroundWindow() != hwnd:
@@ -567,7 +619,22 @@ class Assistant:
             self.auto_click.set(False)
             self.status.set("自动点击位置与路线不一致，已暂停。请手动核对牌面。")
             return
+        before_count = tray_count(self.pending[5])
+        expected_count = (len(self.state.tray) if self.tool_engine else
+                          sum(self.state.tray))
+        if before_count != expected_count:
+            self._trace("pre_click_mismatch", action=action,
+                        observed=before_count, expected=expected_count)
+            self.pending = None
+            self.auto_click.set(False)
+            self.status.set(f"自动点击已暂停：游戏槽位为 {before_count} 张，"
+                            f"模型记录 {expected_count} 张，请先核对同步。")
+            return
+        self.verify_retry = 0
         self.auto_pending = True
+        self._trace("attempt", action=action, removed=bin(self.state.removed).count("1"),
+                    tray=expected_count, aux=[len(stack) for stack in self.state.aux]
+                    if self.tool_engine else [])
         old_x, old_y = cursor()
         button_down = False
         try:
@@ -731,8 +798,8 @@ class Assistant:
             tray_after = ImageGrab.grab(bbox=(
                 int(rect[0]+40*scale), int(rect[1]+835*rect[3]/1067),
                 int(rect[0]+530*scale), int(rect[1]+920*rect[3]/1067))).convert("RGB")
-            score = max(change_score(before, after),
-                        change_score(tray_before, tray_after))
+            target_score = change_score(before, after)
+            score = max(target_score, change_score(tray_before, tray_after))
             if tile_id == "MOVE_OUT" and extra and extra[0] is not None:
                 area_after = ImageGrab.grab(bbox=aux_area(rect)).convert("RGB")
                 score = max(score, change_score(extra[0], area_after))
@@ -741,8 +808,38 @@ class Assistant:
                     self.aux_centers = centers
                     self.aux_rect = rect
         except Exception:
+            target_score = 0
+            tray_after = None
             score = 0
         threshold = 5 if isinstance(tile_id, tuple) else 3
+        if self.auto_pending and tile_id != "MOVE_OUT":
+            try:
+                next_state = (self.tool_engine.apply(self.state, tile_id)
+                              if self.tool_engine else self.board.move(self.state, tile_id))
+                expected_count = (len(next_state.tray) if self.tool_engine else
+                                  sum(next_state.tray))
+            except IllegalMove:
+                expected_count = None
+            actual_count = tray_count(tray_after)
+            if (actual_count is None or expected_count is None or
+                    actual_count != expected_count or target_score < threshold):
+                if (before is not None and tray_before is not None and
+                        getattr(self, "verify_retry", 0) < 2):
+                    self.verify_retry += 1
+                    self.root.after(350, self._verify_click)
+                    return
+                self.auto_click.set(False)
+                self.auto_pending = False
+                self._trace("verify_mismatch", action=tile_id,
+                            observed=actual_count, expected=expected_count,
+                            target_score=round(target_score, 2))
+                self.status.set("自动点击已暂停：目标牌或槽位张数与预期不符。"
+                                f"游戏槽位 {actual_count} 张，预期 {expected_count} 张；"
+                                "请核对游戏画面后再处理这步。")
+                return
+            self._trace("verified", action=tile_id, observed=actual_count,
+                        expected=expected_count,
+                        target_score=round(target_score, 2))
         if score >= threshold:
             self._accept(tile_id)
         else:
@@ -795,6 +892,13 @@ class Assistant:
                                          self.special_cards.rng.state))
         self.state = next_state
         self.clicks.append(tile_id)
+        self._trace("accepted", action=tile_id,
+                    removed=bin(next_state.removed).count("1"),
+                    tray=len(next_state.tray) if self.tool_engine else sum(next_state.tray),
+                    aux=[len(stack) for stack in next_state.aux]
+                    if self.tool_engine else [],
+                    used_remove=next_state.used_remove if self.tool_engine else False,
+                    used_revive=next_state.used_revive if self.tool_engine else False)
         if (getattr(self, "special_cards", None) and tile_id not in ("MOVE_OUT", "REVIVE")
                 and len(next_state.tray) < before_tray):
             self.board = self.special_cards.after_crush(self.board,

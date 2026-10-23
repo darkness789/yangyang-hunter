@@ -92,7 +92,9 @@ class ToolEngine:
             if all(self.board.tiles[tray[j]].type == kind for j in range(i, i+3)):
                 tray = tray[:i] + tray[i+3:]
                 break
-        return ToolState(removed, tray, aux, state.used_remove, state.used_revive)
+        return ToolState(removed, tray, aux, state.used_remove,
+                         state.used_revive,
+                         len(tray) >= 7 and state.used_revive)
 
     def won(self, state):
         return state.removed == self.board.all_mask and not state.tray and not any(state.aux)
