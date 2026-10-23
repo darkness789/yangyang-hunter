@@ -16,7 +16,7 @@ def _segment(board, state, path):
         token = board.tiles[action].id if isinstance(action, int) else action
         current = engine.apply(current, token)
         segment.append(token)
-        if len(current.tray) < before:
+        if action not in ("MOVE_OUT", "REVIVE") and len(current.tray) < before:
             return segment
     return []
 
@@ -151,20 +151,47 @@ def _local_triple(board, state, deadline, cancel_event, special_cards=None):
 
 def plan_next_crush(board, state, seconds=5, seed=0, cancel_event=None,
                     special_cards=None):
-    """Find a thick-first segment ending at the next triple."""
+    """Find a triple before spending a tool, then validate any tool route."""
     if cancel_event is not None and cancel_event.is_set():
         return []
-    segment = _local_triple(board, state, time.monotonic() + seconds * .7,
+    if len(state.tray) >= 7:
+        return ["REVIVE"] if not state.used_revive else []
+
+    segment = _local_triple(board, state, time.monotonic() + seconds * .55,
                             cancel_event, special_cards)
     if segment or (cancel_event is not None and cancel_event.is_set()):
         return segment
 
-    # If no triple is nearby, use a longer route only up to the next recolor.
+    # Look farther without tools before spending either one. A static path is
+    # valid only until its first actual triple, when changing cards recolor.
     engine = ToolEngine(board)
     result = search_with_tools(
-        board, seconds=seconds * .3, max_states=180_000, max_branches=14,
-        initial_state=engine.search_start(state), remove_min=5,
-        seed=seed, cancel_event=cancel_event)
+        board, seconds=seconds * .25, max_states=180_000, max_branches=14,
+        initial_state=engine.search_start(state), allow_remove=False,
+        allow_revive=False, allow_unmatched_aux=True, seed=seed,
+        cancel_event=cancel_event)
     if cancel_event is not None and cancel_event.is_set():
         return []
-    return _segment(board, state, result["path"])
+    segment = _segment(board, state, result["path"])
+    if segment:
+        return segment
+
+    # Move Out is only useful if its freed slots lead to a verified triple.
+    # Reserve Revive for a tray that has actually reached seven cards.
+    if state.used_remove or len(state.tray) < 4:
+        return []
+    moved = engine.apply(state, "MOVE_OUT")
+    segment = _local_triple(board, moved, time.monotonic() + seconds * .2,
+                            cancel_event, special_cards)
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+    if not segment:
+        result = search_with_tools(
+            board, seconds=seconds * .1, max_states=100_000,
+            max_branches=14, initial_state=engine.search_start(moved),
+            allow_remove=False, allow_revive=False,
+            allow_unmatched_aux=True, seed=seed, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+        segment = _segment(board, moved, result["path"])
+    return ["MOVE_OUT"] + segment if segment else []

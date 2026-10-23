@@ -1101,7 +1101,9 @@ class Assistant:
             else:
                 self.status.set(f"特殊关卡规划失败：{error}" if error else
                                 ("已根据当前变色牌规划到下一次三消；三消后自动重算。"
-                                 if segment else "暂未找到安全的下一组三消。可使用移出道具或重新规划。"))
+                                 if segment else
+                                 "暂未找到安全的下一组三消；移出也未验证到后续三消。"
+                                 "可重新规划或重新开局。"))
             self.render()
 
         threading.Thread(target=work, daemon=True).start()
