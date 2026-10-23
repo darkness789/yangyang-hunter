@@ -64,11 +64,20 @@ def _existing_template(map_id, template_dir, capture_dir):
             _validate_template(data, map_id)
         except (OSError, ValueError, TypeError, KeyError):
             continue
+        # Older cached decoders discarded protobuf field 7. Preset cards may
+        # be changing cards, so obtain the raw map and decode it again.
+        cards = [card for layer in data["levelData"].values() for card in layer]
+        if any(card.get("type", 0) > 0 for card in cards) and any(
+                "metaType" not in card for card in cards):
+            continue
         return path
     return None
 
 
 def _captured_map_file(map_id, capture_dir):
+    direct = capture_dir / f"map_{map_id}.bin"
+    if direct.is_file():
+        return direct
     index = capture_dir / "index.jsonl"
     if not index.is_file():
         return None

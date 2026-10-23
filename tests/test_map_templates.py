@@ -39,7 +39,8 @@ def sample_map(preset=False):
     if preset:
         for index in range(3, 6):
             card = (message(1, f"card-{index}".encode()) + number(2, 2) +
-                    number(3, index * 8) + number(4, 0) + number(5, 1))
+                    number(3, index * 8) + number(4, 0) + number(5, 1) +
+                    number(7, 2))
             cards.append(message(1, card))
     layer = message(1, b"1") + message(2, b"".join(cards))
     body = (number(1, 8) + number(2, 10) + number(3, 12345) +
@@ -113,6 +114,7 @@ class MapTemplateTests(unittest.TestCase):
             self.assertEqual(len(cards), 6)
             self.assertEqual(sum(card["type"] == 0 for card in cards), 3)
             self.assertEqual(sum(card["type"] == 2 for card in cards), 3)
+            self.assertEqual(sum(card["metaType"] == 2 for card in cards), 3)
 
 
 if __name__ == "__main__":

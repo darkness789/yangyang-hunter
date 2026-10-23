@@ -67,5 +67,25 @@ for (const [layer, cards] of Object.entries(map.levelData).sort((a, b) => +a[0] 
 if (types.length || Object.values(map.levelData).flat().some(card => !card.type)) {
   throw new Error('Map/type counts do not align');
 }
+// The client shuffles ColorChangedWhenCrush cards once when level two opens.
+// Its board iterator visits numeric layer, row, then column keys in order.
+const changing = Object.values(map.levelData).flat()
+  .filter(card => card.metaType === 2)
+  .sort((a, b) => a.layerNum - b.layerNum || a.rowNum - b.rowNum ||
+    a.rolNum - b.rolNum);
+if (changing.length > 1) {
+  const current = changing.map(card => card.type);
+  for (let i = current.length - 1; i >= 0; i--) {
+    const j = Math.floor(rng.random() * (i + 1));
+    [current[i], current[j]] = [current[j], current[i]];
+  }
+  changing.forEach((card, index) => { card.type = current[index]; });
+}
+map.specialRng = {
+  state: [rng.state0U >>> 0, rng.state0L >>> 0,
+          rng.state1U >>> 0, rng.state1L >>> 0],
+  changingIds: changing.map(card => card.id),
+};
 fs.writeFileSync(outputPath, JSON.stringify(map, null, 2));
-process.stdout.write(JSON.stringify({levelKey: map.levelKey, assigned, output: outputPath}) + '\n');
+process.stdout.write(JSON.stringify({levelKey: map.levelKey, assigned,
+  changing: changing.length, output: outputPath}) + '\n');

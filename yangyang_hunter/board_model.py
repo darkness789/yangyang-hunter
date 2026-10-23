@@ -23,6 +23,7 @@ class Tile:
     y: int
     layer: int
     mold: int
+    meta: int = 0
 
 
 @dataclass(frozen=True)
@@ -52,7 +53,7 @@ class Board:
         tiles = [
             Tile(node["id"], int(node["type"]), int(node.get("rolNum", 0)),
                  int(node.get("rowNum", 0)), int(node["layerNum"]),
-                 int(node.get("moldType", 1)))
+                 int(node.get("moldType", 1)), int(node.get("metaType", 0)))
             for layer in data["levelData"].values() for node in layer
         ]
         return cls(tiles)

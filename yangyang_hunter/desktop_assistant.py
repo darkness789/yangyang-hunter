@@ -18,6 +18,8 @@ from PIL import ImageChops, ImageGrab, ImageStat
 
 from .board_model import Board, IllegalMove
 from .map_templates import acquire_second_stage_template
+from .special_rules import SpecialCards
+from .special_planner import plan_next_crush
 from .route_planner import plan_route
 from .search_checkpoint import load_checkpoint, save_checkpoint
 from .solve import depth_search, replay
@@ -174,6 +176,8 @@ class Assistant:
         self.args = args
         self.board = None
         self.tool_engine = None
+        self.special_cards = None
+        self.special_history = []
         self.map_file = None
         self.state = None
         self.clicks = []
@@ -206,6 +210,7 @@ class Assistant:
         self.overlay_enabled = tk.BooleanVar(value=True)
         self.auto_track = tk.BooleanVar(value=True)
         self.auto_click = tk.BooleanVar(value=False)
+        self.special_mode = tk.BooleanVar(value=False)
         self.auto_next_at = 0.0
         self.auto_pending = False
         self._build_ui()
@@ -242,6 +247,9 @@ class Assistant:
         ttk.Checkbutton(main, text="自动识别我在游戏中的点击", variable=self.auto_track).pack(anchor="w")
         ttk.Checkbutton(main, text="自动点击普通牌（道具手动）", variable=self.auto_click,
                         command=self._auto_mode_changed).pack(anchor="w")
+        ttk.Checkbutton(main, text="特殊关卡：三消后重新计算变色牌",
+                        variable=self.special_mode,
+                        command=self._special_mode_changed).pack(anchor="w")
         row3 = ttk.Frame(main)
         row3.pack(fill="x", pady=(6, 0))
         self.manual_choice = tk.StringVar()
@@ -251,7 +259,7 @@ class Assistant:
         self.manual_picker.pack(side="left")
         ttk.Button(row3, text="补记这张牌", command=self.manual_sync).pack(side="left", padx=5)
         ttk.Button(row3, text="重试", command=self.clear_pending).pack(side="left")
-        self.root.geometry(f"410x420+{x}+{y}")
+        self.root.geometry(f"410x450+{x}+{y}")
         self.overlay = tk.Toplevel(self.root)
         self.overlay.overrideredirect(True)
         self.overlay.attributes("-topmost", True)
@@ -313,6 +321,7 @@ class Assistant:
             raise ValueError("保存的续接状态已失败")
         self.board = board
         self.tool_engine = None
+        self.special_cards = None
         self.search_candidate = ()
         self.map_file = path
         self.state = state
@@ -344,6 +353,7 @@ class Assistant:
             raise ValueError("道具路线无法完整通关")
         self.board = board
         self.tool_engine = engine
+        self.special_cards = None
         self.search_candidate = ()
         self.map_file = path
         self.state = state
@@ -358,6 +368,29 @@ class Assistant:
         self.status.set("已载入含移出和复活的完整路线。" if self.stage2_active
                         else "第一关自行完成；检测到第二关后自动开始辅助。")
         self.render()
+
+    def load_special_board(self, path):
+        board = Board.from_json(path)
+        special = SpecialCards.from_map(board, path)
+        self.board = board
+        self.tool_engine = ToolEngine(board)
+        self.special_cards = special
+        self.special_history = []
+        self.map_file = path
+        self.state = self.tool_engine.initial()
+        self.clicks = []
+        self.plan = []
+        self.pending = None
+        self.aux_centers = None
+        self.aux_rect = None
+        self.search_failed = False
+        self.search_attempt = 0
+        self.stage2_active = False
+        self.stage2_hits = 0
+        self.preparing = False
+        self.status.set(f"已还原 {len(special.changing_ids)} 张变色牌，正在规划下一组三消…")
+        self.render()
+        self.replan()
 
     def render(self):
         if self.board is None:
@@ -489,6 +522,14 @@ class Assistant:
                 self.status.set("自动点击已开启；等待完整路线。")
         else:
             self.status.set("自动点击已开启；道具操作仍需手动完成。")
+
+    def _special_mode_changed(self):
+        self.auto_click.set(False)
+        if self.board is not None:
+            self.status.set("模式将在“监听下一局”后生效；当前局面继续使用原模式。")
+        else:
+            self.status.set("特殊关卡模式已开启。进入下一局后按三消结果重新规划。"
+                            if self.special_mode.get() else "已恢复普通关卡模式。")
 
     def _poll_auto(self):
         if (not self.auto_click.get() or not self.board or not self.plan or
@@ -746,10 +787,35 @@ class Assistant:
         if next_state.lost:
             self.status.set("模型显示这步会填满 7 格，请核对游戏状态。")
             return
+        before_tray = len(self.state.tray) if self.tool_engine else 0
+        if getattr(self, "special_cards", None):
+            self.special_history.append((self.board, self.state,
+                                         self.special_cards.rng.state))
         self.state = next_state
         self.clicks.append(tile_id)
+        if (getattr(self, "special_cards", None) and tile_id not in ("MOVE_OUT", "REVIVE")
+                and len(next_state.tray) < before_tray):
+            self.board = self.special_cards.after_crush(self.board,
+                                                        next_state.removed)
+            self.tool_engine = ToolEngine(self.board)
+            self.plan = []
+            self.auto_click.set(False)
+            if self.tool_engine.won(self.state):
+                self.status.set("路线已完成，请确认游戏显示通关画面。")
+                self.render()
+            else:
+                self.status.set("三消完成，变色牌已按本局种子更新，正在重新规划…")
+                self.render()
+                self.replan()
+            return
         if self.plan and tile_id == self.plan[0]:
             self.plan.pop(0)
+            if (getattr(self, "special_cards", None) and not self.plan
+                    and tile_id in ("MOVE_OUT", "REVIVE")):
+                self.status.set("道具操作已记录，正在规划下一组三消…")
+                self.replan()
+                self.render()
+                return
             if (self.plan and self.plan[0] in ("MOVE_OUT", "REVIVE")
                     and self.auto_click.get()):
                 self._pause_auto_for_tool(self.plan[0])
@@ -769,6 +835,16 @@ class Assistant:
     def undo(self):
         self.pending = None
         self.auto_pending = False
+        if self.special_cards:
+            if not self.special_history:
+                self.status.set("没有可撤销的识别。")
+                return
+            self.board, self.state, self.special_cards.rng.state = self.special_history.pop()
+            self.tool_engine = ToolEngine(self.board)
+            self.clicks.pop()
+            self.plan = []
+            self.replan()
+            return
         if not self.clicks or not self.board:
             return
         self.clicks.pop()
@@ -815,9 +891,13 @@ class Assistant:
             epoch, cancel_event = self._next_work()
             self.status.set("正在从本机抓包记录恢复本局地图并求解…")
             threading.Thread(target=self._prepare_new_board,
-                             args=(epoch, cancel_event), daemon=True).start()
+                             args=(epoch, cancel_event, self.special_mode.get()),
+                             daemon=True).start()
             return
         if self.solving:
+            return
+        if self.special_cards:
+            self._replan_special()
             return
         if self.auto_click.get():
             self.auto_click.set(False)
@@ -880,6 +960,40 @@ class Assistant:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _replan_special(self):
+        self.solving = True
+        epoch, cancel_event = self._next_work()
+        board, state = self.board, self.state
+        self.search_attempt += 1
+        attempt = self.search_attempt
+        self.status.set("正在按变色后的牌面寻找下一组三消…")
+
+        def work():
+            try:
+                segment = plan_next_crush(board, state, seed=attempt - 1,
+                                          cancel_event=cancel_event)
+                if self._current_work(epoch, cancel_event):
+                    self.root.after(0, lambda: finish(segment, None))
+            except Exception as exc:
+                if self._current_work(epoch, cancel_event):
+                    self.root.after(0, lambda error=str(exc): finish([], error))
+
+        def finish(segment, error):
+            if not self._current_work(epoch, cancel_event):
+                return
+            self.solving = False
+            if self.board is not board or self.state != state:
+                self.replan()
+                return
+            self.plan = segment
+            self.search_failed = not bool(segment)
+            self.status.set(f"特殊关卡规划失败：{error}" if error else
+                            ("已根据当前变色牌规划到下一次三消；三消后自动重算。"
+                             if segment else "暂未找到安全的下一组三消。可使用移出道具或重新规划。"))
+            self.render()
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _finish_replan(self, epoch, cancel_event, board, state, ids, error,
                        candidate=()):
         if not self._current_work(epoch, cancel_event):
@@ -930,6 +1044,8 @@ class Assistant:
         self.capture_stamp = seed_path.stat().st_mtime_ns if seed_path.exists() else 0
         self.board = None
         self.tool_engine = None
+        self.special_cards = None
+        self.special_history = []
         self.map_file = None
         self.state = None
         self.plan = []
@@ -999,7 +1115,8 @@ class Assistant:
             epoch, cancel_event = self._next_work()
             self.status.set("已获取本局种子，正在查找或下载第二关地图…")
             threading.Thread(target=self._prepare_new_board,
-                             args=(epoch, cancel_event), daemon=True).start()
+                             args=(epoch, cancel_event, self.special_mode.get()),
+                             daemon=True).start()
         elif self.capture_proc.poll() is not None and not self.preparing:
             self.capture_proc = None
             self.status.set("抓取已结束。如果尚未拿到种子，请检查代理和证书。")
@@ -1032,7 +1149,7 @@ class Assistant:
         self.capture_stop_thread = thread
         thread.start()
 
-    def _prepare_new_board(self, epoch, cancel_event):
+    def _prepare_new_board(self, epoch, cancel_event, special_enabled=False):
         current = lambda: self._current_work(epoch, cancel_event)
         typed_temporary = CAPTURES / f"typed_current_{epoch}.tmp"
         try:
@@ -1054,6 +1171,10 @@ class Assistant:
                 return
             typed_temporary.replace(typed)
             board = Board.from_json(typed)
+            if special_enabled and any(tile.meta == 2 for tile in board.tiles):
+                self.root.after(0, lambda: self.load_special_board(typed)
+                                if current() else None)
+                return
             engine = ToolEngine(board)
             previous_attempts, previous_path = load_checkpoint(
                 SEARCH_CHECKPOINT, board)

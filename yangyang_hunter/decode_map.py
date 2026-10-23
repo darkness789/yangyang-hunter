@@ -62,6 +62,7 @@ def decode_node(data):
         "rowNum": raw.get(4, 0),
         "layerNum": raw.get(5, 0),
         "moldType": raw.get(6, 0),
+        "metaType": raw.get(7, 0),
     }
 
 

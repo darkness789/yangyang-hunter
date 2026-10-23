@@ -4,7 +4,9 @@
 
 项目在一局 225 张牌的第二关上完成过真实通关。那局使用了一次“移出”和一次“复活”；求解器支持这两种道具，以及从移出区取回卡牌。规划时先尝试普通路线，再从已到达的深层局面使用道具，并尝试不同的开局、选牌顺序和道具时机。后续关卡是否能找到路线仍取决于地图和搜索预算，程序不会把超时当作“无解”。
 
-当前本机捕获的一局 216 张牌难局已通过完整路线搜索和规则引擎重放验证，测试机器约 10 秒求解，回归地图在 `tests/fixtures/difficult_216.json`。自动规划会先找普通选牌路线，再从其深入位置尝试道具，同时保留不同开局的搜索；30 秒时给出提示并继续搜索，单轮预算约 120 秒。若仍未找到，可点击“重新规划”或重新开一局。随机洗牌会改变牌型分布，目前未纳入自动规划。
+当前本机捕获的一局 216 张牌难局已通过完整路线搜索和规则引擎重放验证，测试机器约 10 秒求解，回归地图在 `tests/fixtures/difficult_216.json`。自动规划会先找普通选牌路线，再从其深入位置尝试道具，同时保留不同开局的搜索；30 秒时给出提示并继续搜索，单轮预算约 120 秒。若仍未找到，可点击“重新规划”或重新开一局。道具“洗牌”会改变全图牌型分布，目前未纳入自动规划。
+
+对于含变色牌的特殊地图，可在监听新局前勾选“特殊关卡：三消后重新计算变色牌”。程序根据地图中的变色牌标记和本局种子复现游戏的洗牌规则，每次只提示到下一次三消，三消后更新牌型再规划。该模式仍是逐段搜索，当前不能保证找到整局通关路线；道具需要手动使用，变色牌的牌面预测依赖游戏客户端的规则和随机数消耗顺序。普通模式保持原有完整路线搜索。
 
 ## 准备环境
 
@@ -48,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ## 工作原理
 
 1. [capture_map.py](yangyang_hunter/capture_map.py) 和 [seed_probe.py](yangyang_hunter/seed_probe.py) 通过 mitmproxy 获取关卡地图与本局种子。只保存需要的响应数据，并过滤常见身份字段。
-2. [map_templates.py](yangyang_hunter/map_templates.py) 查找或获取本局地图，[decode_map.py](yangyang_hunter/decode_map.py) 解析地图；[restore_types.js](scripts/restore_types.js) 依据种子还原每张牌的图案。`yangyang_hunter/templates/` 放有已知地图结构模板，不含用户凭据；新地图只保存在本机 `captures/`。
+2. [map_templates.py](yangyang_hunter/map_templates.py) 查找或获取本局地图，[decode_map.py](yangyang_hunter/decode_map.py) 解析地图；[restore_types.js](scripts/restore_types.js) 依据种子还原每张牌的图案及变色牌开局洗牌。[special_rules.py](yangyang_hunter/special_rules.py) 在三消后继续重放变色规则。`yangyang_hunter/templates/` 放有已知地图结构模板，不含用户凭据；新地图只保存在本机 `captures/`。
 3. [board_model.py](yangyang_hunter/board_model.py)、[solve.py](yangyang_hunter/solve.py) 和 [solve_with_tools.py](yangyang_hunter/solve_with_tools.py) 建模遮挡、七格槽和道具，搜索并重放验证路线。
 4. [desktop_assistant.py](yangyang_hunter/desktop_assistant.py) 显示下一步，监听玩家的点击；开启自动模式后也可点击普通牌。每步检查画面变化，再推进或重新规划。
 
