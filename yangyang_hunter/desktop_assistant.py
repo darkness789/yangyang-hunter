@@ -182,9 +182,13 @@ class Assistant:
         self.aux_centers = None
         self.aux_rect = None
         self.capture_proc = None
+        self.capture_stop_thread = None
         self.capture_stamp = None
         self.solving = False
         self.preparing = False
+        self.work_epoch = 0
+        self.cancel_event = threading.Event()
+        self.capture_starting = False
         self.prepare_attempt = 0
         self.search_failed = False
         self.search_attempt = 0
@@ -778,8 +782,24 @@ class Assistant:
         self.replan()
         self.render()
 
+    def _next_work(self):
+        self.cancel_event.set()
+        self.cancel_event = threading.Event()
+        self.work_epoch += 1
+        return self.work_epoch, self.cancel_event
+
+    def _current_work(self, epoch, cancel_event):
+        return self.work_epoch == epoch and not cancel_event.is_set()
+
+    def _search_status(self, epoch, cancel_event, message):
+        self.root.after(0, lambda: self.status.set(message)
+                        if self._current_work(epoch, cancel_event) else None)
+
     def replan(self):
         if not self.board:
+            if self.capture_starting:
+                self.status.set("正在启动监听，请先进入新关卡。")
+                return
             if self.preparing:
                 return
             seed_path = CAPTURES / "recovered_seed.json"
@@ -792,14 +812,17 @@ class Assistant:
                 self.status.set("没有本局种子。请点“监听下一局”，再进入关卡。")
                 return
             self.preparing = True
+            epoch, cancel_event = self._next_work()
             self.status.set("正在从本机抓包记录恢复本局地图并求解…")
-            threading.Thread(target=self._prepare_new_board, daemon=True).start()
+            threading.Thread(target=self._prepare_new_board,
+                             args=(epoch, cancel_event), daemon=True).start()
             return
         if self.solving:
             return
         if self.auto_click.get():
             self.auto_click.set(False)
         self.solving = True
+        epoch, cancel_event = self._next_work()
         board, state = self.board, self.state
         engine = self.tool_engine
         self.search_attempt += 1
@@ -807,7 +830,8 @@ class Assistant:
         self.status.set("正在计算当前局面的路线…")
         self.root.after(SEARCH_TIMEOUT_SECONDS * 1000, lambda: self.status.set(
             "已搜索 30 秒，仍在继续找完整路线；结束后可考虑重新开局。")
-            if self.solving and self.search_attempt == attempt else None)
+            if (self.solving and self.search_attempt == attempt and
+                self._current_work(epoch, cancel_event)) else None)
 
         def work():
             candidate = ()
@@ -819,8 +843,11 @@ class Assistant:
                         initial_state=search_state,
                         seed_offset=attempt,
                         candidate_path=self.search_candidate,
-                        on_progress=lambda message: self.root.after(
-                            0, lambda text=message: self.status.set(text)))
+                        cancel_event=cancel_event,
+                        on_progress=lambda message: self._search_status(
+                            epoch, cancel_event, message))
+                    if not self._current_work(epoch, cancel_event):
+                        return
                     ids = [board.tiles[item].id if isinstance(item, int) else item
                            for item in result["path"]]
                     check = state
@@ -834,20 +861,29 @@ class Assistant:
                     result = depth_search(board, seconds=SEARCH_TIMEOUT_SECONDS,
                                           seed=attempt,
                                           initial_state=state, max_branches=6,
-                                          max_states=3_000_000)
+                                          max_states=3_000_000,
+                                          cancel_event=cancel_event)
+                    if not self._current_work(epoch, cancel_event):
+                        return
                     ids = [board.tiles[index].id for index in result["path"]]
                     verified = (result["status"] == "solved" and
                                 replay(board, result["path"], state))
                 if result["status"] != "solved" or not verified:
                     raise ValueError("本次搜索未找到完整路线。可再试重新规划或重新开局；这不代表无解")
-                self.root.after(0, lambda: self._finish_replan(board, state, ids, None))
+                self.root.after(0, lambda: self._finish_replan(
+                    epoch, cancel_event, board, state, ids, None))
             except Exception as exc:
-                self.root.after(0, lambda error=str(exc), path=candidate:
-                                self._finish_replan(board, state, None, error, path))
+                if self._current_work(epoch, cancel_event):
+                    self.root.after(0, lambda error=str(exc), path=candidate:
+                                    self._finish_replan(epoch, cancel_event,
+                                                        board, state, None, error, path))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _finish_replan(self, board, state, ids, error, candidate=()):
+    def _finish_replan(self, epoch, cancel_event, board, state, ids, error,
+                       candidate=()):
+        if not self._current_work(epoch, cancel_event):
+            return
         self.solving = False
         if self.board is not board or self.state != state:
             self.replan()
@@ -875,15 +911,21 @@ class Assistant:
         self.render()
 
     def start_capture(self):
-        if self.preparing:
-            self.status.set("当前关卡仍在准备中，请稍候。")
-            return
-        if self.capture_proc is not None:
+        if (self.capture_proc is not None and self.board is None and
+                not self.preparing and not self.solving):
             self.status.set("已经在监听下一局。")
+            return
+        if self.capture_starting:
+            self.status.set("正在启动监听，请稍候。")
             return
         if not (SCRIPTS / "start_capture.ps1").exists():
             self.status.set("找不到抓取脚本。")
             return
+        self._next_work()
+        self.preparing = False
+        self.solving = False
+        self.prepare_attempt += 1
+        self.auto_click.set(False)
         seed_path = CAPTURES / "recovered_seed.json"
         self.capture_stamp = seed_path.stat().st_mtime_ns if seed_path.exists() else 0
         self.board = None
@@ -906,8 +948,18 @@ class Assistant:
         self.tray.set("")
         self.status.set("正在准备抓取。启动后请在微信小程序中重新进入关卡。")
 
+        if self.capture_proc is not None and self.capture_proc.poll() is None:
+            self.status.set("已中断旧关卡搜索，继续监听下一局。请重新进入关卡。")
+            return
+        self.capture_proc = None
+        self.capture_starting = True
+        epoch = self.work_epoch
+
         def work():
             try:
+                stopping = self.capture_stop_thread
+                if stopping is not None and stopping.is_alive():
+                    stopping.join(timeout=35)
                 subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                                 "-File", str(SCRIPTS / "install_capture_cert.ps1")],
                                check=True, capture_output=True, text=True, timeout=45)
@@ -917,14 +969,24 @@ class Assistant:
                                          "-SeedProbe", "-DurationSeconds", "600"],
                                         cwd=ROOT, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.PIPE, creationflags=flags)
-                self.root.after(0, lambda: self._capture_started(proc))
+                self.root.after(0, lambda: self._capture_started(proc, epoch))
             except Exception as exc:
-                self.root.after(0, lambda error=str(exc): self.status.set(
-                    f"抓取启动失败：{error}"))
+                self.root.after(0, lambda error=str(exc): self._capture_failed(
+                    epoch, error))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _capture_started(self, proc):
+    def _capture_failed(self, epoch, error):
+        if epoch == self.work_epoch:
+            self.capture_starting = False
+            self.status.set(f"抓取启动失败：{error}")
+
+    def _capture_started(self, proc, epoch):
+        if epoch != self.work_epoch:
+            self.capture_starting = False
+            proc.terminate()
+            return
+        self.capture_starting = False
         self.capture_proc = proc
         self.status.set("正在监听新开局。现在打开小程序并进入关卡；识别到地图后会自动求解。")
 
@@ -934,8 +996,10 @@ class Assistant:
                 seed_path.stat().st_mtime_ns > self.capture_stamp):
             self.capture_stamp = seed_path.stat().st_mtime_ns
             self.preparing = True
+            epoch, cancel_event = self._next_work()
             self.status.set("已获取本局种子，正在查找或下载第二关地图…")
-            threading.Thread(target=self._prepare_new_board, daemon=True).start()
+            threading.Thread(target=self._prepare_new_board,
+                             args=(epoch, cancel_event), daemon=True).start()
         elif self.capture_proc.poll() is not None and not self.preparing:
             self.capture_proc = None
             self.status.set("抓取已结束。如果尚未拿到种子，请检查代理和证书。")
@@ -964,37 +1028,51 @@ class Assistant:
                             "-File", str(SCRIPTS / "remove_capture_cert.ps1")],
                            capture_output=True, timeout=15)
 
-        threading.Thread(target=work, daemon=True).start()
+        thread = threading.Thread(target=work, daemon=True)
+        self.capture_stop_thread = thread
+        thread.start()
 
-    def _prepare_new_board(self):
-        self.prepare_attempt += 1
-        attempt = self.prepare_attempt
+    def _prepare_new_board(self, epoch, cancel_event):
+        current = lambda: self._current_work(epoch, cancel_event)
+        typed_temporary = CAPTURES / f"typed_current_{epoch}.tmp"
         try:
             seed = json.loads((CAPTURES / "recovered_seed.json").read_text(encoding="utf-8"))
             template = acquire_second_stage_template(
                 seed, PACKAGE_ROOT / "templates", CAPTURES,
                 wait_seconds=8 if self.capture_proc is not None else 0)
-            self.root.after(0, self.stop_capture)
-            self.root.after(0, lambda: self.status.set("地图已准备好，正在还原牌面并求解…"))
+            if not current():
+                return
+            self.root.after(0, lambda: self.stop_capture() if current() else None)
+            self._search_status(epoch, cancel_event,
+                                "地图已准备好，正在还原牌面并求解…")
             typed = CAPTURES / "typed_current.json"
             subprocess.run(["node", str(SCRIPTS / "restore_types.js"),
-                            str(template), str(CAPTURES / "recovered_seed.json"), str(typed)],
+                            str(template), str(CAPTURES / "recovered_seed.json"),
+                            str(typed_temporary)],
                            check=True, capture_output=True, text=True, timeout=30)
+            if not current():
+                return
+            typed_temporary.replace(typed)
             board = Board.from_json(typed)
             engine = ToolEngine(board)
             previous_attempts, previous_path = load_checkpoint(
                 SEARCH_CHECKPOINT, board)
+            if not current():
+                return
             self.search_attempt = previous_attempts
-            self.root.after(0, lambda: self.status.set("正在搜索完整路线…"))
+            self._search_status(epoch, cancel_event, "正在搜索完整路线…")
             self.root.after(SEARCH_TIMEOUT_SECONDS * 1000, lambda: self.status.set(
                 "已搜索 30 秒，仍在继续找完整路线；结束后可考虑重新开局。")
-                if self.preparing and self.prepare_attempt == attempt else None)
+                if self.preparing and current() else None)
             planned = plan_route(
                 board, seconds=SEARCH_BUDGET_SECONDS,
                 seed_offset=previous_attempts,
                 candidate_path=previous_path,
-                on_progress=lambda message: self.root.after(
-                    0, lambda text=message: self.status.set(text)))
+                cancel_event=cancel_event,
+                on_progress=lambda message: self._search_status(
+                    epoch, cancel_event, message))
+            if not current():
+                return
             actions = None
             if planned["status"] == "solved":
                 actions = [board.tiles[item].id if isinstance(item, int)
@@ -1003,21 +1081,30 @@ class Assistant:
                 check = engine.initial()
                 for action in actions:
                     check = engine.apply(check, action)
+                if not current():
+                    return
                 if engine.won(check):
                     (CAPTURES / "solution_current.json").write_text(json.dumps({
                         "status": "solved", "verified": True, "actions": actions,
                         "map_file": str(typed)}, ensure_ascii=False, indent=2), encoding="utf-8")
-                    self.root.after(0, lambda route=actions: self.load_tool_board(typed, route))
+                    self.root.after(0, lambda route=actions: self.load_tool_board(
+                        typed, route) if current() else None)
                     return
             self.root.after(0, lambda path=planned["path"],
                             attempts=previous_attempts:
-                            self._load_unsolved(typed, path, attempts))
+                            self._load_unsolved(typed, path, attempts)
+                            if current() else None)
         except Exception as exc:
-            self.root.after(0, self.stop_capture)
-            self.root.after(0, lambda error=str(exc): self.status.set(
-                f"新关卡准备失败：{error}。可点“重新规划”重试本局。"))
+            if current():
+                self.root.after(0, lambda: self.stop_capture() if current() else None)
+                self._search_status(epoch, cancel_event,
+                    f"新关卡准备失败：{exc}。可点“重新规划”重试本局。")
         finally:
-            self.root.after(0, lambda: setattr(self, "preparing", False))
+            if typed_temporary.exists():
+                typed_temporary.unlink()
+            if current():
+                self.root.after(0, lambda: setattr(self, "preparing", False)
+                                if current() else None)
 
     def _load_unsolved(self, path, candidate=(), attempts=0):
         self.board = Board.from_json(path)
@@ -1040,6 +1127,8 @@ class Assistant:
         self.render()
 
     def _close(self):
+        self.cancel_event.set()
+        self.work_epoch += 1
         self.stop_capture()
         self.root.destroy()
 

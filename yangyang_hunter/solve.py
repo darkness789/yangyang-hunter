@@ -73,7 +73,8 @@ def _after_move(board, unlock_targets, removed, available, index):
 
 def depth_search(board, seconds=60, seed=0, initial_state=None,
                  max_branches=5, max_states=2000000, coarse=False,
-                 priority_jitter=18, unlock_match_weight=0):
+                 priority_jitter=18, unlock_match_weight=0,
+                 cancel_event=None):
     """Bounded exact-state DFS, ordered toward matches and upper layers."""
     if any(tile.type <= 0 for tile in board.tiles):
         raise ValueError("Every tile needs a recovered nonzero type")
@@ -96,6 +97,8 @@ def depth_search(board, seconds=60, seed=0, initial_state=None,
     def visit(removed, tray, available, counts):
         nonlocal nodes, best
         nodes += 1
+        if cancel_event is not None and cancel_event.is_set():
+            return "cancelled"
         if nodes % 1024 == 0 and (time.monotonic() >= deadline or
                                   nodes >= max_states):
             return "timeout"
@@ -154,7 +157,7 @@ def depth_search(board, seconds=60, seed=0, initial_state=None,
             path.append(index)
             result = visit(next_removed, tuple(next_tray), next_available,
                            tuple(next_counts))
-            if result in ("solved", "timeout"):
+            if result in ("solved", "timeout", "cancelled"):
                 return result
             path.pop()
         return "dead"
@@ -166,6 +169,10 @@ def depth_search(board, seconds=60, seed=0, initial_state=None,
     if result == "solved":
         return {"status": "solved", "path": tuple(path),
                 "depth": len(path), "elapsed": elapsed, "states": nodes}
+    if result == "cancelled":
+        return {"status": "cancelled", "path": tuple(best),
+                "depth": len(best), "elapsed": elapsed, "states": nodes,
+                "limit": "cancelled"}
     return {"status": "not_found", "path": tuple(best),
             "depth": len(best), "elapsed": elapsed, "states": nodes,
             "limit": result if result == "timeout" else "search_exhausted"}

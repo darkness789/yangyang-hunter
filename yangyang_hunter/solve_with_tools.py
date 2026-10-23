@@ -108,7 +108,8 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
                       max_branches=6, seed=0, allow_remove=True,
                       allow_revive=True, prefix=(), initial_state=None,
                       remove_min=6, priority_jitter=18,
-                      allow_unmatched_aux=False, unlock_match_weight=0):
+                      allow_unmatched_aux=False, unlock_match_weight=0,
+                      cancel_event=None):
     if prefix and initial_state is not None:
         raise ValueError("Use either prefix or initial_state")
     start = time.monotonic()
@@ -134,6 +135,8 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
     def visit(removed, available, tray, moved, used_remove, used_revive):
         nonlocal nodes, best
         nodes += 1
+        if cancel_event is not None and cancel_event.is_set():
+            return "cancelled"
         if nodes % 1024 == 0 and (nodes >= max_states or time.monotonic() >= deadline):
             return "limit"
         if removed == board.all_mask and not tray and not any(moved):
@@ -157,7 +160,7 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
                            tuple(moved[i] + ((tray[i],) if i < count else ())
                                  for i in range(3)),
                            used_remove, True)
-            if result in ("solved", "limit"):
+            if result in ("solved", "limit", "cancelled"):
                 return result
             path.pop()
             return "dead"
@@ -171,7 +174,7 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
                            tuple(moved[i] + ((tray[i],) if i < count else ())
                                  for i in range(3)),
                            True, used_revive)
-            if result in ("solved", "limit"):
+            if result in ("solved", "limit", "cancelled"):
                 return result
             path.pop()
 
@@ -228,7 +231,7 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
             path.append(choice)
             result = visit(next_removed, next_available, next_tray,
                            next_moved, used_remove, used_revive)
-            if result in ("solved", "limit"):
+            if result in ("solved", "limit", "cancelled"):
                 return result
             path.pop()
         return "dead"
@@ -241,7 +244,7 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
         "removed": start_removed, "lost": False})()))
     result = visit(start_removed, available, start_tray,
                    start_aux, used_remove, used_revive)
-    return {"status": result if result == "solved" else "not_found",
+    return {"status": result if result in ("solved", "cancelled") else "not_found",
             "path": tuple(path if result == "solved" else best),
             "depth": sum(isinstance(item, int) for item in
                          (path if result == "solved" else best)),

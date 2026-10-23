@@ -11,7 +11,7 @@ from .solve_with_tools import ToolEngine, search_with_tools
 
 
 def plan_route(board, seconds=120, initial_state=None, on_progress=None,
-               seed_offset=0, candidate_path=()):
+               seed_offset=0, candidate_path=(), cancel_event=None):
     """Search with several genuinely different move and tool orderings.
 
     ``initial_state`` is ToolEngine.search_start's type-level tuple. All
@@ -24,6 +24,16 @@ def plan_route(board, seconds=120, initial_state=None, on_progress=None,
     deadline = started + seconds
     best = {"status": "not_found", "path": (), "depth": 0}
     attempts = 0
+
+    def cancelled_result():
+        return dict(best, status="cancelled", attempts=attempts,
+                    elapsed=time.monotonic() - started, limit="cancelled")
+
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    if cancelled():
+        return cancelled_result()
     engine = ToolEngine(board)
     fresh = initial_state is None or initial_state == (
         0, (), ((), (), ()), False, False)
@@ -58,7 +68,10 @@ def plan_route(board, seconds=120, initial_state=None, on_progress=None,
                               seed=seed_offset, max_branches=12,
                               max_states=1_500_000,
                               priority_jitter=min(180, 18 + 30 * seed_offset),
-                              unlock_match_weight=20 if seed_offset else 0)
+                              unlock_match_weight=20 if seed_offset else 0,
+                              cancel_event=cancel_event)
+        if cancelled():
+            return cancelled_result()
         if record(normal):
             return dict(normal, attempts=attempts,
                         elapsed=time.monotonic() - started)
@@ -71,6 +84,8 @@ def plan_route(board, seconds=120, initial_state=None, on_progress=None,
                      if any(not isinstance(action, int) for action in source)
                      else ((1, 1), (7, 8), (3, 4), (1, 2)))
         for turn, (numerator, denominator) in enumerate(fractions):
+            if cancelled():
+                return cancelled_result()
             if deadline - time.monotonic() < 0.2 or not source:
                 break
             cut = len(source) * numerator // denominator
@@ -89,7 +104,10 @@ def plan_route(board, seconds=120, initial_state=None, on_progress=None,
                 remove_min=(3, 2, 1, 3)[turn],
                 priority_jitter=100 + 20 * turn,
                 allow_unmatched_aux=turn >= 2,
-                unlock_match_weight=20 * turn)
+                unlock_match_weight=20 * turn,
+                cancel_event=cancel_event)
+            if cancelled():
+                return cancelled_result()
             combined = prefix_path + suffix["path"]
             result = dict(suffix, path=combined,
                           depth=sum(isinstance(action, int)
@@ -104,6 +122,8 @@ def plan_route(board, seconds=120, initial_state=None, on_progress=None,
                 (29, 16, 4, 110), (47, 24, 3, 160))
     turn = 0
     while deadline - time.monotonic() > 0.1:
+        if cancelled():
+            return cancelled_result()
         seed, branches, remove_min, jitter = settings[turn % len(settings)]
         seed += 101 * (turn // len(settings)) + 997 * seed_offset
         remaining = deadline - time.monotonic()
@@ -136,7 +156,10 @@ def plan_route(board, seconds=120, initial_state=None, on_progress=None,
             remove_min=(1 if turn >= len(settings) and turn % 2 else remove_min),
             priority_jitter=jitter,
             allow_unmatched_aux=turn >= len(settings),
-            unlock_match_weight=15 * (turn % len(settings)))
+            unlock_match_weight=15 * (turn % len(settings)),
+            cancel_event=cancel_event)
+        if cancelled():
+            return cancelled_result()
         if prefix_path:
             result = dict(result, path=prefix_path + result["path"],
                           depth=sum(isinstance(action, int)
@@ -145,5 +168,7 @@ def plan_route(board, seconds=120, initial_state=None, on_progress=None,
             return dict(result, attempts=attempts,
                         elapsed=time.monotonic() - started)
         turn += 1
+    if cancelled():
+        return cancelled_result()
     return dict(best, status="not_found", attempts=attempts,
                 elapsed=time.monotonic() - started, limit="timeout")
