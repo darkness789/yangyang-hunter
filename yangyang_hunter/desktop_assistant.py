@@ -517,7 +517,9 @@ class Assistant:
             user32.SetForegroundWindow(hwnd)
         if not self.plan:
             if self.board:
-                self.status.set("自动点击已开启，但当前没有完整路线。建议重新开一把或点“重新规划”。")
+                self.status.set("自动点击已开启；等待下一组三消的路线。"
+                                if self.special_cards else
+                                "自动点击已开启，但当前没有完整路线。建议重新开一把或点“重新规划”。")
             else:
                 self.status.set("自动点击已开启；等待完整路线。")
         else:
@@ -799,7 +801,9 @@ class Assistant:
                                                         next_state.removed)
             self.tool_engine = ToolEngine(self.board)
             self.plan = []
-            self.auto_click.set(False)
+            # Keep the user's auto-click choice across a changing-card replan.
+            # The solver and this delay both block clicks during the animation.
+            self.auto_next_at = max(self.auto_next_at, time.monotonic() + 1.2)
             if self.tool_engine.won(self.state):
                 self.status.set("路线已完成，请确认游戏显示通关画面。")
                 self.render()
@@ -987,9 +991,12 @@ class Assistant:
                 return
             self.plan = segment
             self.search_failed = not bool(segment)
-            self.status.set(f"特殊关卡规划失败：{error}" if error else
-                            ("已根据当前变色牌规划到下一次三消；三消后自动重算。"
-                             if segment else "暂未找到安全的下一组三消。可使用移出道具或重新规划。"))
+            if segment and segment[0] in ("MOVE_OUT", "REVIVE") and self.auto_click.get():
+                self._pause_auto_for_tool(segment[0])
+            else:
+                self.status.set(f"特殊关卡规划失败：{error}" if error else
+                                ("已根据当前变色牌规划到下一次三消；三消后自动重算。"
+                                 if segment else "暂未找到安全的下一组三消。可使用移出道具或重新规划。"))
             self.render()
 
         threading.Thread(target=work, daemon=True).start()

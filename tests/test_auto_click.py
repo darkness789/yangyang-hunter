@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from yangyang_hunter.board_model import Board, Tile
 from yangyang_hunter.solve_with_tools import ToolEngine
+from yangyang_hunter.special_rules import SpecialCards
 from yangyang_hunter import desktop_assistant as ui
 
 
@@ -106,6 +107,32 @@ class AutoClickTests(unittest.TestCase):
         with patch.object(ui, "user32", FakeUser32()):
             assistant._auto_mode_changed()
         self.assertTrue(assistant.auto_click.get())
+
+    def test_special_triple_keeps_auto_enabled_during_replan(self):
+        assistant = self.assistant()
+        assistant.board = Board([
+            Tile(str(i), 1 if i < 3 else i, i * 8, 0, 1, 1, 2)
+            for i in range(5)
+        ])
+        assistant.tool_engine = ToolEngine(assistant.board)
+        assistant.special_cards = SpecialCards(
+            assistant.board, [1, 2, 3, 4], [str(i) for i in range(5)])
+        assistant.special_history = []
+        assistant.state = assistant.tool_engine.initial()
+        assistant.plan = ["0", "1", "2"]
+        assistant.clicks = []
+        assistant.render = lambda: None
+        replans = []
+        assistant.replan = lambda: replans.append(True)
+
+        for tile_id in ("0", "1", "2"):
+            assistant._accept(tile_id)
+
+        self.assertTrue(assistant.auto_click.get())
+        self.assertEqual(replans, [True])
+        self.assertEqual(assistant.plan, [])
+        self.assertEqual(len(assistant.state.tray), 0)
+        self.assertGreater(assistant.auto_next_at, 0)
 
     def test_cannot_enable_auto_while_tool_is_next(self):
         assistant = self.assistant("MOVE_OUT")
