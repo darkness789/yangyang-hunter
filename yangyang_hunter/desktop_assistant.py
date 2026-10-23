@@ -1079,7 +1079,8 @@ class Assistant:
         def work():
             try:
                 segment = plan_next_crush(board, state, seed=attempt - 1,
-                                          cancel_event=cancel_event)
+                                          cancel_event=cancel_event,
+                                          special_cards=self.special_cards)
                 if self._current_work(epoch, cancel_event):
                     self.root.after(0, lambda: finish(segment, None))
             except Exception as exc:
