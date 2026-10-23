@@ -107,7 +107,8 @@ class ToolEngine:
 def search_with_tools(board, seconds=180, max_states=10_000_000,
                       max_branches=6, seed=0, allow_remove=True,
                       allow_revive=True, prefix=(), initial_state=None,
-                      remove_min=6, priority_jitter=18):
+                      remove_min=6, priority_jitter=18,
+                      allow_unmatched_aux=False, unlock_match_weight=0):
     if prefix and initial_state is not None:
         raise ValueError("Use either prefix or initial_state")
     start = time.monotonic()
@@ -186,10 +187,14 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
             tile = board.tiles[index]
             held = counts.get(tile.type, 0)
             remaining = board.all_mask & ~removed & ~(1 << index)
-            unlocks = sum(1 for lower in _bits(unlock_targets[index] & remaining)
-                          if not (board.blockers[lower] & remaining))
+            unlocks = 0
+            match_unlocks = 0
+            for lower in _bits(unlock_targets[index] & remaining):
+                if not (board.blockers[lower] & remaining):
+                    unlocks += 1
+                    match_unlocks += counts.get(types[lower], 0)
             score = (100 if held == 2 else 50 if held else 0)
-            score += tile.layer * 2 + unlocks * 8
+            score += tile.layer * 2 + unlocks * 8 + unlock_match_weight * match_unlocks
             if seed:
                 score += randomizer.uniform(-priority_jitter, priority_jitter)
             return score
@@ -203,7 +208,7 @@ def search_with_tools(board, seconds=180, max_states=10_000_000,
             if not moved[slot]:
                 continue
             kind = moved[slot][-1]
-            if counts.get(kind, 0) >= 1 or len(tray) <= 3:
+            if allow_unmatched_aux or counts.get(kind, 0) >= 1 or len(tray) <= 3:
                 choices.append(("AUX", slot))
         for choice in choices:
             if isinstance(choice, tuple):

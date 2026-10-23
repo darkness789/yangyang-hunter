@@ -16,11 +16,22 @@
 
 ## 使用
 
-在项目目录运行：
+Windows 上直接双击项目根目录的 `羊羊狩猎者.exe`。它使用同目录下的 `scripts/`、`yangyang_hunter/templates/`，并将本机抓取数据保存在 `captures/`。请保留这些目录；exe 已包含运行界面所需的 Python 环境，但监听新局仍需要上面列出的 Node.js 和 mitmproxy。
+
+也可以在项目目录从 Python 源码运行：
 
 ```powershell
 pythonw -m yangyang_hunter
 ```
+
+需要重新生成 exe 时，使用 Python 3.8 或更新版本先安装打包工具，然后执行：
+
+```powershell
+py -3.8 -m pip install pyinstaller Pillow
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+```
+
+生成文件位于项目根目录的 `羊羊狩猎者.exe`；`build/` 是可忽略的临时打包文件。
 
 在辅助界面点击“监听下一局”，然后进入小游戏。程序获取本局种子后，会在本地恢复牌面并搜索路线。第一关不会显示提示；进入第二关后，红圈标出建议点击的牌。保持“自动识别我在游戏中的点击”勾选即可按提示手动点击。
 

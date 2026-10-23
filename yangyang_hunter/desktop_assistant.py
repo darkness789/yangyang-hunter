@@ -19,13 +19,21 @@ from PIL import ImageChops, ImageGrab, ImageStat
 from .board_model import Board, IllegalMove
 from .map_templates import acquire_second_stage_template
 from .route_planner import plan_route
+from .search_checkpoint import load_checkpoint, save_checkpoint
 from .solve import depth_search, replay
 from .solve_with_tools import ToolEngine
 
 
-PACKAGE_ROOT = Path(__file__).resolve().parent
-ROOT = PACKAGE_ROOT.parent
+if getattr(sys, "frozen", False):
+    # PyInstaller extracts Python modules to a temporary directory. Keep
+    # captures and the external Node/PowerShell scripts beside the executable.
+    ROOT = Path(sys.executable).resolve().parent
+    PACKAGE_ROOT = ROOT / "yangyang_hunter"
+else:
+    PACKAGE_ROOT = Path(__file__).resolve().parent
+    ROOT = PACKAGE_ROOT.parent
 CAPTURES = ROOT / "captures"
+SEARCH_CHECKPOINT = CAPTURES / "search_checkpoint.json"
 SCRIPTS = ROOT / "scripts"
 SEARCH_TIMEOUT_SECONDS = 30
 SEARCH_BUDGET_SECONDS = 120
@@ -180,6 +188,7 @@ class Assistant:
         self.prepare_attempt = 0
         self.search_failed = False
         self.search_attempt = 0
+        self.search_candidate = ()
         self.last_down = False
         self.rect = None
         self.focus_active = None
@@ -300,6 +309,7 @@ class Assistant:
             raise ValueError("保存的续接状态已失败")
         self.board = board
         self.tool_engine = None
+        self.search_candidate = ()
         self.map_file = path
         self.state = state
         self.clicks = ids[:resume]
@@ -330,6 +340,7 @@ class Assistant:
             raise ValueError("道具路线无法完整通关")
         self.board = board
         self.tool_engine = engine
+        self.search_candidate = ()
         self.map_file = path
         self.state = state
         self.clicks = list(actions[:resume])
@@ -799,12 +810,15 @@ class Assistant:
             if self.solving and self.search_attempt == attempt else None)
 
         def work():
+            candidate = ()
             try:
                 if engine:
                     search_state = engine.search_start(state)
                     result = plan_route(
                         board, seconds=SEARCH_BUDGET_SECONDS,
                         initial_state=search_state,
+                        seed_offset=attempt,
+                        candidate_path=self.search_candidate,
                         on_progress=lambda message: self.root.after(
                             0, lambda text=message: self.status.set(text)))
                     ids = [board.tiles[item].id if isinstance(item, int) else item
@@ -814,6 +828,8 @@ class Assistant:
                         for action in ids:
                             check = engine.apply(check, action)
                     verified = engine.won(check)
+                    if result["status"] != "solved":
+                        candidate = result["path"]
                 else:
                     result = depth_search(board, seconds=SEARCH_TIMEOUT_SECONDS,
                                           seed=attempt,
@@ -826,20 +842,29 @@ class Assistant:
                     raise ValueError("本次搜索未找到完整路线。可再试重新规划或重新开局；这不代表无解")
                 self.root.after(0, lambda: self._finish_replan(board, state, ids, None))
             except Exception as exc:
-                self.root.after(0, lambda error=str(exc): self._finish_replan(board, state, None, error))
+                self.root.after(0, lambda error=str(exc), path=candidate:
+                                self._finish_replan(board, state, None, error, path))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _finish_replan(self, board, state, ids, error):
+    def _finish_replan(self, board, state, ids, error, candidate=()):
         self.solving = False
         if self.board is not board or self.state != state:
             self.replan()
             return
         if error:
             self.search_failed = True
+            if (not state.removed and not state.tray and candidate and
+                    sum(isinstance(action, int) for action in candidate) >
+                    sum(isinstance(action, int) for action in self.search_candidate)):
+                self.search_candidate = tuple(candidate)
+            if self.tool_engine and not state.removed and not state.tray:
+                save_checkpoint(SEARCH_CHECKPOINT, board,
+                                self.search_attempt + 1, self.search_candidate)
             self.status.set(f"重新规划失败：{error}")
         else:
             self.search_failed = False
+            self.search_candidate = ()
             self.plan = ids
             self.status.set("路线已重新计算并验证。")
             if self.tool_engine:
@@ -874,6 +899,7 @@ class Assistant:
         self.stage2_active = False
         self.stage2_hits = 0
         self.search_failed = False
+        self.search_candidate = ()
         self.overlay.withdraw()
         self.target.set("等待第二关")
         self.progress.set("")
@@ -956,12 +982,17 @@ class Assistant:
                            check=True, capture_output=True, text=True, timeout=30)
             board = Board.from_json(typed)
             engine = ToolEngine(board)
+            previous_attempts, previous_path = load_checkpoint(
+                SEARCH_CHECKPOINT, board)
+            self.search_attempt = previous_attempts
             self.root.after(0, lambda: self.status.set("正在搜索完整路线…"))
             self.root.after(SEARCH_TIMEOUT_SECONDS * 1000, lambda: self.status.set(
                 "已搜索 30 秒，仍在继续找完整路线；结束后可考虑重新开局。")
                 if self.preparing and self.prepare_attempt == attempt else None)
             planned = plan_route(
                 board, seconds=SEARCH_BUDGET_SECONDS,
+                seed_offset=previous_attempts,
+                candidate_path=previous_path,
                 on_progress=lambda message: self.root.after(
                     0, lambda text=message: self.status.set(text)))
             actions = None
@@ -978,7 +1009,9 @@ class Assistant:
                         "map_file": str(typed)}, ensure_ascii=False, indent=2), encoding="utf-8")
                     self.root.after(0, lambda route=actions: self.load_tool_board(typed, route))
                     return
-            self.root.after(0, lambda: self._load_unsolved(typed))
+            self.root.after(0, lambda path=planned["path"],
+                            attempts=previous_attempts:
+                            self._load_unsolved(typed, path, attempts))
         except Exception as exc:
             self.root.after(0, self.stop_capture)
             self.root.after(0, lambda error=str(exc): self.status.set(
@@ -986,7 +1019,7 @@ class Assistant:
         finally:
             self.root.after(0, lambda: setattr(self, "preparing", False))
 
-    def _load_unsolved(self, path):
+    def _load_unsolved(self, path, candidate=(), attempts=0):
         self.board = Board.from_json(path)
         self.tool_engine = ToolEngine(self.board)
         self.map_file = path
@@ -999,6 +1032,10 @@ class Assistant:
         self.stage2_active = False
         self.stage2_hits = 0
         self.search_failed = True
+        self.search_candidate = tuple(candidate)
+        self.search_attempt = attempts
+        save_checkpoint(SEARCH_CHECKPOINT, self.board,
+                        attempts + 1, self.search_candidate)
         self.status.set("本次搜索未找到完整路线。这把可能较难；可重新规划或重新开局。这不代表无解。")
         self.render()
 

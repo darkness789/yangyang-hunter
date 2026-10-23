@@ -72,7 +72,8 @@ def _after_move(board, unlock_targets, removed, available, index):
 
 
 def depth_search(board, seconds=60, seed=0, initial_state=None,
-                 max_branches=5, max_states=2000000, coarse=False):
+                 max_branches=5, max_states=2000000, coarse=False,
+                 priority_jitter=18, unlock_match_weight=0):
     """Bounded exact-state DFS, ordered toward matches and upper layers."""
     if any(tile.type <= 0 for tile in board.tiles):
         raise ValueError("Every tile needs a recovered nonzero type")
@@ -132,10 +133,11 @@ def depth_search(board, seconds=60, seed=0, initial_state=None,
             # perturb nearby scores so retries visit genuinely different
             # branches instead of merely changing the order of exact ties.
             remaining = board.all_mask & ~removed & ~(1 << index)
-            score += 8 * sum(1 for lower in _bits(unlock_targets[index] & remaining)
-                             if not (board.blockers[lower] & remaining))
+            for lower in _bits(unlock_targets[index] & remaining):
+                if not (board.blockers[lower] & remaining):
+                    score += 8 + unlock_match_weight * tray[board.tiles[lower].type]
             if seed:
-                score += randomizer.uniform(-18, 18)
+                score += randomizer.uniform(-priority_jitter, priority_jitter)
             return score
 
         choices.sort(key=priority, reverse=True)
