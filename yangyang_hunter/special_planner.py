@@ -45,12 +45,40 @@ def _tray_risk(board, tray):
     return 45 * singles + 45 * crowded * crowded
 
 
+def _reserve_mask(board):
+    """Identify shallow side piles separated from a much taller stack."""
+    heights = [max(other.layer for other in board.tiles
+                   if abs(other.x - tile.x) < 8 and abs(other.y - tile.y) < 8)
+               for tile in board.tiles]
+    levels = sorted(set(heights))
+    if len(levels) < 2:
+        return 0
+    low, high = max(zip(levels, levels[1:]),
+                    key=lambda pair: pair[1] - pair[0])
+    if high - low < max(4, levels[-1] * .2):
+        return 0
+    mask = sum(1 << i for i, height in enumerate(heights)
+               if height <= low)
+    reserve_size = bin(mask).count("1")
+    if (reserve_size < max(9, len(board.tiles) // 20) or
+            reserve_size >= len(board.tiles) // 2):
+        return 0
+    return mask
+
+
 def _local_triple(board, state, deadline, cancel_event, special_cards=None):
     """Compare legal short routes by depth cleared and cards exposed."""
     engine = ToolEngine(board)
     depth = _thickness(board, state.removed)
     start_visible = set(board.visible_indices(state))
     start_risk = _tray_risk(board, state.tray)
+    reserve = _reserve_mask(board)
+    reserve_total = bin(reserve).count("1")
+    thick_total = len(board.tiles) - reserve_total
+    reserve_used = bin(state.removed & reserve).count("1")
+    thick_used = bin(state.removed & ~reserve).count("1")
+    imbalance = max(0, reserve_used / reserve_total - thick_used / thick_total) if reserve_total else 0
+    reserve_cost = 150 + 250 * imbalance
     candidates = []
     seen = {}
     nodes = 0
@@ -90,11 +118,13 @@ def _local_triple(board, state, deadline, cancel_event, special_cards=None):
                 fresh = set(board.visible_indices(after)) - start_visible
                 exposure = sum(min(depth[i], 20) for i in fresh)
                 risk_change = _tray_risk(board, after.tray) - start_risk
+                reserve_clicks = bin((after.removed ^ state.removed) & reserve).count("1")
                 rank = (candidate_score * 3 + exposure * 2
                         - len(after.tray) * 24 - len(candidate) * 65
                         - max(0, risk_change) * 2.25
                         - min(0, risk_change) * .5
-                        - max(0, candidate_peak - 5) * 25)
+                        - max(0, candidate_peak - 5) * 25
+                        - reserve_clicks * reserve_cost)
                 candidates.append((rank, candidate, after))
             else:
                 visit(after, candidate, candidate_score, candidate_peak,

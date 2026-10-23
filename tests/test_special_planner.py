@@ -2,7 +2,8 @@ import unittest
 
 from yangyang_hunter.board_model import Board, Tile
 from yangyang_hunter.solve_with_tools import ToolEngine, ToolState
-from yangyang_hunter.special_planner import _segment, plan_next_crush
+from yangyang_hunter.special_planner import (_reserve_mask, _segment,
+                                            plan_next_crush)
 
 
 class SpecialPlannerTests(unittest.TestCase):
@@ -67,6 +68,18 @@ class SpecialPlannerTests(unittest.TestCase):
         for action in path:
             state = ToolEngine(board).apply(state, action)
         self.assertEqual(len(state.tray), 3)
+
+    def test_keeps_shallow_side_pile_as_reserve(self):
+        tiles = [Tile(f"thin-{i}", 2, 100 + i * 16, 0, 4, 1)
+                 for i in range(9)]
+        tiles += [Tile(f"center-{i}", 1 if i < 3 else 10 + i,
+                       i * 16, 100, 20, 1) for i in range(11)]
+        board = Board(tiles)
+        self.assertEqual(bin(_reserve_mask(board)).count("1"), 9)
+        path = plan_next_crush(board, ToolEngine(board).initial(),
+                               seconds=.5)
+        self.assertEqual(set(path),
+                         {"center-0", "center-1", "center-2"})
 
 
 if __name__ == "__main__":
