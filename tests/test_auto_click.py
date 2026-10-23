@@ -4,6 +4,7 @@ from dataclasses import replace
 from PIL import Image
 
 from yangyang_hunter.board_model import Board, Tile
+from yangyang_hunter.board_geometry import BoardGeometry
 from yangyang_hunter.solve_with_tools import ToolEngine
 from yangyang_hunter.special_rules import SpecialCards
 from yangyang_hunter import desktop_assistant as ui
@@ -61,6 +62,7 @@ class AutoClickTests(unittest.TestCase):
     def assistant(self, action="0"):
         assistant = ui.Assistant.__new__(ui.Assistant)
         assistant.board = Board([Tile("0", 1, 0, 0, 1, 1)])
+        assistant.board_geometry = BoardGeometry(110, 6.3, 300, 6.25, 1)
         assistant.tool_engine = ToolEngine(assistant.board)
         assistant.state = assistant.tool_engine.initial()
         assistant.plan = [action]

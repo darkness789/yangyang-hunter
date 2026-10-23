@@ -20,6 +20,7 @@ from .board_model import Board, IllegalMove
 from .map_templates import acquire_second_stage_template
 from .special_rules import SpecialCards
 from .special_planner import plan_next_crush
+from .board_geometry import calibrate_board
 from .route_planner import plan_route
 from .search_checkpoint import load_checkpoint, save_checkpoint
 from .solve import depth_search, replay
@@ -94,10 +95,10 @@ def cursor():
     return point.x, point.y
 
 
-def tile_center(tile, rect):
+def tile_center(tile, rect, geometry):
     left, top, width, height = rect
-    return (left + (110 + 6.3 * tile.x) * width / 573,
-            top + (300 + 6.25 * tile.y) * height / 1067)
+    x, y = geometry.center(tile)
+    return left + x * width / 573, top + y * height / 1067
 
 
 def crop_at(x, y, radius=20):
@@ -198,6 +199,8 @@ class Assistant:
         self.root = root
         self.args = args
         self.board = None
+        self.board_geometry = None
+        self.geometry_retry_at = 0.0
         self.tool_engine = None
         self.special_cards = None
         self.special_history = []
@@ -344,6 +347,7 @@ class Assistant:
         if state.lost:
             raise ValueError("保存的续接状态已失败")
         self.board = board
+        self.board_geometry = None
         self.tool_engine = None
         self.special_cards = None
         self.search_candidate = ()
@@ -376,6 +380,7 @@ class Assistant:
         if not engine.won(verified):
             raise ValueError("道具路线无法完整通关")
         self.board = board
+        self.board_geometry = None
         self.tool_engine = engine
         self.special_cards = None
         self.search_candidate = ()
@@ -397,6 +402,7 @@ class Assistant:
         board = Board.from_json(path)
         special = SpecialCards.from_map(board, path)
         self.board = board
+        self.board_geometry = None
         self.tool_engine = ToolEngine(board)
         self.special_cards = special
         self.special_history = []
@@ -500,8 +506,11 @@ class Assistant:
         elif action == "MOVE_OUT":
             sx, sy = left + 116*width/573, top + 1000*height/1067
         else:
+            if not self._ensure_board_geometry(rect):
+                self.overlay.withdraw()
+                return
             tile = self.board.tiles[self.board.index[action]]
-            sx, sy = tile_center(tile, rect)
+            sx, sy = tile_center(tile, rect, self.board_geometry)
         x, y = sx - left, sy - top
         scale = width / 573
         radius = 28 * scale
@@ -510,6 +519,27 @@ class Assistant:
         self.canvas.create_oval(x-4, y-4, x+4, y+4, fill="#ff1717", outline="white")
         self.overlay.deiconify()
         self.overlay.lift()
+
+    def _ensure_board_geometry(self, rect):
+        if self.board_geometry is not None:
+            return True
+        if time.monotonic() < self.geometry_retry_at:
+            return False
+        self.geometry_retry_at = time.monotonic() + 1.0
+        try:
+            left, top, width, height = rect
+            image = ImageGrab.grab(bbox=(left, top, left+width, top+height))
+            self.board_geometry = calibrate_board(image, self.board, self.state)
+        except Exception:
+            self.board_geometry = None
+        if self.board_geometry is None:
+            if self.auto_click.get():
+                self.auto_click.set(False)
+            hint = "棋盘位置校准失败，已暂停标记和自动点击；请核对地图或重新识别。"
+            if self.status.get() != hint:
+                self.status.set(hint)
+            return False
+        return True
 
     def _aux_points(self, rect):
         left, top, width, height = rect
@@ -612,7 +642,10 @@ class Assistant:
                 return
             x, y = centers[action[1]]
         else:
-            x, y = tile_center(self.board.tiles[self.board.index[action]], rect)
+            if not self._ensure_board_geometry(rect):
+                return
+            x, y = tile_center(self.board.tiles[self.board.index[action]],
+                               rect, self.board_geometry)
         self._candidate_click(x, y, rect)
         if not self.pending or self.pending[0] != action:
             self.pending = None
@@ -758,18 +791,20 @@ class Assistant:
                 self.root.after(650, self._verify_click)
                 return
         visible = self.board.visible_indices(self.state)
+        if not self._ensure_board_geometry(rect):
+            return
         scale = rect[2] / 573
         candidates = []
         for index in visible:
             tile = self.board.tiles[index]
-            cx, cy = tile_center(tile, rect)
+            cx, cy = tile_center(tile, rect, self.board_geometry)
             if abs(cx-x) <= 27*scale and abs(cy-y) <= 27*scale:
                 candidates.append((tile.layer, -(cx-x)**2-(cy-y)**2, index))
         if not candidates:
             return
         index = max(candidates)[2]
         tile = self.board.tiles[index]
-        cx, cy = tile_center(tile, rect)
+        cx, cy = tile_center(tile, rect, self.board_geometry)
         try:
             before = crop_at(cx, cy)
             tray_before = ImageGrab.grab(bbox=(
@@ -1158,6 +1193,7 @@ class Assistant:
         seed_path = CAPTURES / "recovered_seed.json"
         self.capture_stamp = seed_path.stat().st_mtime_ns if seed_path.exists() else 0
         self.board = None
+        self.board_geometry = None
         self.tool_engine = None
         self.special_cards = None
         self.special_history = []
