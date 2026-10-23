@@ -523,9 +523,15 @@ class Assistant:
     def _ensure_board_geometry(self, rect):
         if self.board_geometry is not None:
             return True
+        game_hwnd = user32.FindWindowW(None, TITLE)
+        if user32.GetForegroundWindow() != game_hwnd:
+            hint = "等待游戏窗口置前以校准棋盘；请点击游戏画面。"
+            if self.status.get() != hint:
+                self.status.set(hint)
+            return False
         if time.monotonic() < self.geometry_retry_at:
             return False
-        self.geometry_retry_at = time.monotonic() + 1.0
+        self.geometry_retry_at = time.monotonic() + 0.7
         try:
             left, top, width, height = rect
             image = ImageGrab.grab(bbox=(left, top, left+width, top+height))
@@ -533,12 +539,13 @@ class Assistant:
         except Exception:
             self.board_geometry = None
         if self.board_geometry is None:
-            if self.auto_click.get():
-                self.auto_click.set(False)
-            hint = "棋盘位置校准失败，已暂停标记和自动点击；请核对地图或重新识别。"
+            hint = "暂时无法校准棋盘，标记和自动点击等待重试；请保持游戏画面可见。"
             if self.status.get() != hint:
                 self.status.set(hint)
             return False
+        if self.status.get().startswith(("等待游戏窗口置前以校准棋盘",
+                                         "暂时无法校准棋盘")):
+            self.status.set("棋盘位置已校准，可以继续按提示操作。")
         return True
 
     def _aux_points(self, rect):
@@ -702,7 +709,11 @@ class Assistant:
                 game_hwnd = user32.FindWindowW(None, TITLE)
                 panel_hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
                 active = foreground in (game_hwnd, panel_hwnd)
-                if rect != self.rect or active != self.focus_active:
+                retry_geometry = (self.board_geometry is None and self.plan and
+                                  self.stage2_active and rect is not None and
+                                  foreground == game_hwnd and
+                                  time.monotonic() >= self.geometry_retry_at)
+                if rect != self.rect or active != self.focus_active or retry_geometry:
                     self._draw_overlay()
         except Exception as exc:
             self.status.set(f"监控异常：{exc}")
@@ -1380,6 +1391,7 @@ class Assistant:
 
     def _load_unsolved(self, path, candidate=(), attempts=0):
         self.board = Board.from_json(path)
+        self.board_geometry = None
         self.tool_engine = ToolEngine(self.board)
         self.map_file = path
         self.state = self.tool_engine.initial()

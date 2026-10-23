@@ -117,6 +117,41 @@ class AutoClickTests(unittest.TestCase):
         self.assertTrue(assistant.auto_pending)
         self.assertIn(("move", 227, 777), fake.events)
 
+    def test_temporary_calibration_failure_retries_without_disabling_auto(self):
+        assistant = self.assistant()
+        assistant.board_geometry = None
+        assistant.geometry_retry_at = 0
+        geometry = BoardGeometry(84, 7.13, 235, 7.15, 1)
+        fake = FakeUser32()
+        with patch.object(ui, "user32", fake), \
+                patch.object(ui.ImageGrab, "grab", return_value=Image.new("RGB", (573, 1067))), \
+                patch.object(ui, "calibrate_board", side_effect=(None, geometry)):
+            self.assertFalse(assistant._ensure_board_geometry((0, 0, 573, 1067)))
+            self.assertTrue(assistant.auto_click.get())
+            assistant.geometry_retry_at = 0
+            self.assertTrue(assistant._ensure_board_geometry((0, 0, 573, 1067)))
+        self.assertEqual(assistant.board_geometry, geometry)
+
+    def test_poll_retries_calibration_after_game_comes_to_front(self):
+        assistant = self.assistant()
+        assistant.board_geometry = None
+        assistant.geometry_retry_at = 0
+        assistant.capture_proc = None
+        assistant.rect = (0, 0, 573, 1067)
+        assistant.focus_active = True
+        assistant.root = type("Root", (), {
+            "winfo_id": lambda self: 3,
+            "after": lambda self, *_: None,
+        })()
+        assistant._poll_mouse = lambda: None
+        assistant._poll_auto = lambda: None
+        retried = []
+        assistant._draw_overlay = lambda: retried.append(True)
+        with patch.object(ui, "user32", FakeUser32()), \
+                patch.object(ui, "game_rect", return_value=assistant.rect):
+            assistant._poll()
+        self.assertEqual(retried, [True])
+
     def test_auto_stops_before_clicking_if_tray_is_out_of_sync(self):
         assistant = self.assistant(("AUX", 1))
         assistant.board = Board([Tile(str(i), 1, i * 8, 0, 1, 1)
