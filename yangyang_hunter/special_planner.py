@@ -37,16 +37,25 @@ def _thickness(board, removed):
     return tuple(result)
 
 
+def _tray_risk(board, tray):
+    """Penalize distinct unmatched cards and the loss of spare tray slots."""
+    counts = Counter(board.tiles[index].type for index in tray)
+    singles = sum(count == 1 for count in counts.values())
+    crowded = max(0, len(tray) - 4)
+    return 45 * singles + 45 * crowded * crowded
+
+
 def _local_triple(board, state, deadline, cancel_event, special_cards=None):
     """Compare legal short routes by depth cleared and cards exposed."""
     engine = ToolEngine(board)
     depth = _thickness(board, state.removed)
     start_visible = set(board.visible_indices(state))
+    start_risk = _tray_risk(board, state.tray)
     candidates = []
     seen = {}
     nodes = 0
 
-    def visit(current, path, score):
+    def visit(current, path, score, peak, max_depth):
         nonlocal nodes
         nodes += 1
         if nodes > 120_000 or time.monotonic() >= deadline or (
@@ -56,7 +65,7 @@ def _local_triple(board, state, deadline, cancel_event, special_cards=None):
         if seen.get(key, -1) >= score:
             return
         seen[key] = score
-        if len(path) >= 4 or len(current.tray) >= 7:
+        if len(path) >= max_depth or len(current.tray) >= 7:
             return
         actions = [board.tiles[i].id for i in board.visible_indices(current)]
         actions += [("AUX", i) for i, stack in enumerate(current.aux) if stack]
@@ -76,16 +85,29 @@ def _local_triple(board, state, deadline, cancel_event, special_cards=None):
             index = board.index[action] if isinstance(action, str) else None
             candidate_score = score + (depth[index] if index is not None else 0)
             candidate = path + [action]
+            candidate_peak = max(peak, len(after.tray))
             if len(after.tray) < len(current.tray):
                 fresh = set(board.visible_indices(after)) - start_visible
                 exposure = sum(min(depth[i], 20) for i in fresh)
+                risk_change = _tray_risk(board, after.tray) - start_risk
                 rank = (candidate_score * 3 + exposure * 2
-                        - len(after.tray) * 24 - len(candidate) * 65)
+                        - len(after.tray) * 24 - len(candidate) * 65
+                        - max(0, risk_change) * 2.25
+                        - min(0, risk_change) * .5
+                        - max(0, candidate_peak - 5) * 25)
                 candidates.append((rank, candidate, after))
             else:
-                visit(after, candidate, candidate_score)
+                visit(after, candidate, candidate_score, candidate_peak,
+                      max_depth)
 
-    visit(state, [], 0)
+    # Short routes are explored across all opening cards before any four-click
+    # route. Otherwise a large thick stack can consume the entire time budget
+    # before a safe match on the other side of the board is considered.
+    for max_depth in range(1, 5):
+        seen.clear()
+        visit(state, [], 0, len(state.tray), max_depth)
+        if time.monotonic() >= deadline:
+            break
     if not candidates:
         return []
     candidates.sort(key=lambda item: item[0], reverse=True)
@@ -108,12 +130,18 @@ def _local_triple(board, state, deadline, cancel_event, special_cards=None):
         counts.update(recolored.tiles[stack[-1]].type
                       for stack in after.aux if stack)
         held = Counter(recolored.tiles[i].type for i in after.tray)
+        available = Counter(recolored.tiles[i].type for i in visible)
+        available.update(recolored.tiles[stack[-1]].type
+                         for stack in after.aux if stack)
+        stranded = sum(count == 1 and available[kind] < 2
+                       for kind, count in held.items())
         reachable = sum(count >= 3 and
                         len(after.tray) + 3 - held[kind] <= 7
                         for kind, count in counts.items())
         one_away = sum(held[kind] == 2 and counts[kind] >= 3
                        for kind in held)
         future = (rank + min(reachable, 6) * 28 + one_away * 20
+                  - stranded * 30
                   - (180 if reachable == 0 and after.removed != board.all_mask
                      else 0))
         if best is None or future > best[0]:
